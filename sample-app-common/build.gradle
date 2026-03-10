@@ -1,0 +1,123 @@
+plugins {
+    id 'com.android.library'
+    id 'kotlin-android'
+    id 'kotlin-parcelize'
+    id 'kotlinx-serialization'
+}
+
+def getDefaultUrl() {
+    return hasProperty('livekitSampleUrl') ? livekitSampleUrl : "ws://www.example.com"
+}
+
+def getDefaultToken() {
+    return hasProperty('livekitSampleToken') ? livekitSampleToken : ""
+}
+
+def getUseMergeStartCall() {
+    return hasProperty('livekitUseMergeStartCall') ? livekitUseMergeStartCall.toBoolean() : false
+}
+
+def getMergeStartCallParam() {
+    return hasProperty('livekitMergeStartCallParam') ? livekitMergeStartCallParam.replace('"', '\\"') : ""
+}
+
+def getEnableDeviceRotation() {
+    return hasProperty('livekitEnableDeviceRotation') ? livekitEnableDeviceRotation.toBoolean() : false
+}
+
+def getOpenMicrophone() {
+    return hasProperty('livekitOpenMicrophone') ? livekitOpenMicrophone.toBoolean() : false
+}
+
+def getMicrophonePublishMute() {
+    return hasProperty('livekitMicrophonePublishMute') ? livekitMicrophonePublishMute.toBoolean() : false
+}
+
+def getOpenCamera() {
+    return hasProperty('livekitOpenCamera') ? livekitOpenCamera.toBoolean() : false
+}
+
+
+final url = getDefaultUrl().strip()
+final token = getDefaultToken().strip()
+final useMergeStartCall = getUseMergeStartCall()
+final mergeStartCallParam = getMergeStartCallParam().strip()
+final enableDeviceRotation = getEnableDeviceRotation()
+final openMicrophone = getOpenMicrophone()
+final microphonePublishMute = getMicrophonePublishMute()
+final openCamera = getOpenCamera()
+
+android {
+    namespace "io.livekit.android.sample.common"
+    compileSdk androidSdk.compileVersion
+
+    defaultConfig {
+        minSdk androidSdk.minVersion
+        targetSdk androidSdk.targetVersion
+        consumerProguardFiles 'consumer-rules.pro'
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+
+            buildConfigField "String", "DEFAULT_URL", "\"$url\""
+            buildConfigField "String", "DEFAULT_TOKEN", "\"$token\""
+            buildConfigField "boolean", "USE_MERGE_START_CALL", useMergeStartCall.toString()
+            buildConfigField "String", "MERGE_START_CALL_PARAM", "\"$mergeStartCallParam\""
+            buildConfigField "boolean", "ENABLE_DEVICE_ROTATION", enableDeviceRotation.toString()
+            buildConfigField "boolean", "OPEN_MICROPHONE", openMicrophone.toString()
+            buildConfigField "boolean", "MICROPHONE_PUBLISH_MUTE", microphonePublishMute.toString()
+            buildConfigField "boolean", "OPEN_CAMERA", openCamera.toString()
+        }
+
+        debug {
+            buildConfigField "String", "DEFAULT_URL", "\"$url\""
+            buildConfigField "String", "DEFAULT_TOKEN", "\"$token\""
+            buildConfigField "boolean", "USE_MERGE_START_CALL", useMergeStartCall.toString()
+            buildConfigField "String", "MERGE_START_CALL_PARAM", "\"$mergeStartCallParam\""
+            buildConfigField "boolean", "ENABLE_DEVICE_ROTATION", enableDeviceRotation.toString()
+            buildConfigField "boolean", "OPEN_MICROPHONE", openMicrophone.toString()
+            buildConfigField "boolean", "MICROPHONE_PUBLISH_MUTE", microphonePublishMute.toString()
+            buildConfigField "boolean", "OPEN_CAMERA", openCamera.toString()
+        }
+    }
+    buildFeatures {
+        buildConfig = true
+    }
+    compileOptions {
+        sourceCompatibility java_version
+        targetCompatibility java_version
+    }
+    kotlinOptions {
+        jvmTarget = java_version
+    }
+}
+
+dependencies {
+
+    // If building the sample app outside the context of this repo, replace the following with:
+    // api "io.livekit:livekit-android:<version>"
+    api project(":livekit-android-sdk")
+    api project(":livekit-android-camerax")
+
+    api libs.androidx.core.ktx
+    api libs.appcompat
+    api libs.material
+    api libs.coroutines.lib
+    api libs.androidx.lifecycle.runtime.ktx
+    api libs.androidx.lifecycle.viewmodel.ktx
+    api libs.androidx.lifecycle.common.java8
+    api libs.androidx.lifecycle.process
+    api libs.protobuf.javalite
+    api libs.androidx.preference.ktx
+    api libs.kotlinx.serialization.json
+    // debugImplementation because LeakCanary should only run in debug builds.
+//    debugImplementation libs.leakcanary.android
+
+    testImplementation libs.junit
+    androidTestImplementation libs.androidx.test.core
+}

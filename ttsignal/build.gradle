@@ -1,0 +1,129 @@
+plugins {
+    id 'com.android.library'
+    id 'maven-publish'
+}
+
+android {
+    namespace 'org.difft.android.smp'
+    compileSdkVersion androidSdk.compileVersion
+    ndkVersion '26.1.10909125'
+
+    defaultConfig {
+        minSdkVersion androidSdk.minVersion
+        targetSdkVersion androidSdk.targetVersion
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        consumerProguardFiles "consumer-rules.pro"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+    compileOptions {
+        sourceCompatibility java_version
+        targetCompatibility java_version
+    }
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ['src/main/jniLibs']
+        }
+    }
+    publishing {
+        singleVariant("release") {
+            withJavadocJar()
+            withSourcesJar()
+        }
+    }
+}
+
+tasks.register('buildNativeLibs', Exec) {
+    description = 'Build native .so libraries and copy to jniLibs'
+
+    def submoduleDir = file('ttsignal')
+    def buildScript = file('ttsignal/android/scripts/build-so.sh')
+
+    onlyIf {
+        if (!buildScript.exists()) {
+            throw new GradleException(
+                'ttsignal submodule not initialized. ' +
+                'Run: git submodule update --init ttsignal/ttsignal')
+        }
+        return true
+    }
+
+    workingDir submoduleDir
+
+    def sdkDir = android.sdkDirectory
+    def ndkDir = android.ndkDirectory
+    environment 'ANDROID_HOME', sdkDir.absolutePath
+    environment 'ANDROID_SDK_ROOT', sdkDir.absolutePath
+    environment 'ANDROID_NDK_HOME', ndkDir.absolutePath
+
+    commandLine 'bash', 'android/scripts/build-so.sh'
+
+    doLast {
+        def abis = ['arm64-v8a', 'armeabi-v7a']
+        def destRoot = file('src/main/jniLibs')
+
+        abis.each { abi ->
+            def destDir = new File(destRoot, abi)
+            destDir.mkdirs()
+
+            def candidates = [
+                "android/libs/${abi}/libsignal.so",
+                "build/android/${abi}/libsignal.so",
+                "build/${abi}/libsignal.so",
+                "output/${abi}/libsignal.so",
+                "target/${abi}/libsignal.so",
+            ]
+
+            def found = candidates.collect { new File(submoduleDir, it) }
+                .find { it.exists() }
+
+            if (found == null) {
+                def tree = fileTree(submoduleDir) {
+                    include "**/${abi}/libsignal.so"
+                }
+                found = tree.files.find()
+            }
+
+            if (found == null) {
+                throw new GradleException("libsignal.so for ${abi} not found under ${submoduleDir}")
+            }
+
+            copy {
+                from found
+                into destDir
+            }
+            println "copied: ${found} -> ${destDir}/libsignal.so"
+        }
+    }
+}
+
+tasks.configureEach { task ->
+    if (task.name == 'mergeReleaseJniLibFolders' || task.name == 'mergeDebugJniLibFolders') {
+        task.dependsOn 'buildNativeLibs'
+    }
+}
+
+dependencies {
+    testImplementation libs.junit
+    androidTestImplementation libs.androidx.test.junit
+    androidTestImplementation libs.espresso
+}
+
+afterEvaluate {
+    publishing {
+        publications {
+            release(MavenPublication) {
+                from components.release
+                groupId = GROUP
+                artifactId = POM_ARTIFACT_ID
+                version = VERSION_NAME
+            }
+        }
+    }
+}
