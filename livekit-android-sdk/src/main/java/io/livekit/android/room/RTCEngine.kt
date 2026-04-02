@@ -718,7 +718,10 @@ internal constructor(
                 val publisherConnected = publisher?.isConnected() == true
                 val subscriberConnected = subscriber?.isConnected() == true
                 val reconnected = subscriberConnected && (!hasPublished || publisherConnected)
-                LKLog.i { "[${retries + 1}] reconnect-check subscriberConnected=$subscriberConnected, publisherConnected=$publisherConnected, hasPublished=$hasPublished, reconnected=$reconnected" }
+                LKLog.i {
+                    "[${retries + 1}] reconnect-check subscriberConnected=$subscriberConnected, " +
+                        "publisherConnected=$publisherConnected, hasPublished=$hasPublished, reconnected=$reconnected"
+                }
 
                 if (reconnected) {
                     if (connectionState != ConnectionState.CONNECTED) {
@@ -1303,7 +1306,12 @@ internal constructor(
         if (buffer == null) {
             return
         }
-        var dp = LivekitModels.DataPacket.parseFrom(ByteString.copyFrom(buffer.data))
+        var dp = try {
+            LivekitModels.DataPacket.parseFrom(ByteString.copyFrom(buffer.data))
+        } catch (e: com.google.protobuf.InvalidProtocolBufferException) {
+            LKLog.w(e) { "Failed to parse DataPacket, discarding malformed message." }
+            return
+        }
 
         if (dp.sequence > 0 && dp.participantSid.isNotEmpty()) {
             synchronized(reliableStateLock) {
@@ -1332,7 +1340,12 @@ internal constructor(
                 LKLog.i { "Failed to decrypt data packet." }
                 return
             }
-            val payload = LivekitModels.EncryptedPacketPayload.parseFrom(decryptedData)
+            val payload = try {
+                LivekitModels.EncryptedPacketPayload.parseFrom(decryptedData)
+            } catch (e: com.google.protobuf.InvalidProtocolBufferException) {
+                LKLog.w(e) { "Failed to parse decrypted EncryptedPacketPayload, discarding message." }
+                return
+            }
 
             dp = with(dp.toBuilder()) {
                 setFromEncryptedPayload(payload)
@@ -1368,14 +1381,14 @@ internal constructor(
             LivekitModels.DataPacket.ValueCase.RPC_REQUEST,
             LivekitModels.DataPacket.ValueCase.RPC_ACK,
             LivekitModels.DataPacket.ValueCase.RPC_RESPONSE,
-                -> {
+            -> {
                 listener?.onRpcPacketReceived(dp)
             }
 
             LivekitModels.DataPacket.ValueCase.STREAM_HEADER,
             LivekitModels.DataPacket.ValueCase.STREAM_CHUNK,
             LivekitModels.DataPacket.ValueCase.STREAM_TRAILER,
-                -> {
+            -> {
                 listener?.onDataStreamPacket(dp, encryptionType)
             }
 
@@ -1385,7 +1398,7 @@ internal constructor(
 
             LivekitModels.DataPacket.ValueCase.VALUE_NOT_SET,
             null,
-                -> {
+            -> {
                 LKLog.v { "invalid value for data packet" }
             }
         }
@@ -1595,7 +1608,7 @@ internal fun LivekitModels.DataPacket.asEncryptedPacketPayload(): LivekitModels.
         LivekitModels.DataPacket.ValueCase.ENCRYPTED_PACKET,
         LivekitModels.DataPacket.ValueCase.TRANSCRIPTION,
         LivekitModels.DataPacket.ValueCase.VALUE_NOT_SET,
-            -> {
+        -> {
             null
         }
     }

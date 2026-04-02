@@ -6,7 +6,7 @@ plugins {
 android {
     namespace 'org.difft.android.smp'
     compileSdkVersion androidSdk.compileVersion
-    ndkVersion '26.1.10909125'
+    ndkVersion '28.0.13004108'
 
     defaultConfig {
         minSdkVersion androidSdk.minVersion
@@ -101,6 +101,31 @@ tasks.register('buildNativeLibs', Exec) {
             println "copied: ${found} -> ${destDir}/libsignal.so"
         }
     }
+}
+
+tasks.register('rebuildNativeLibs') {
+    description = 'Clean and force-rebuild native .so libraries'
+    group = 'build'
+
+    doFirst {
+        def submoduleDir = file('ttsignal')
+        def buildRoot = new File(submoduleDir, 'android/build')
+        def jniLibsRoot = file('src/main/jniLibs')
+
+        if (buildRoot.exists()) {
+            println "cleaning: ${buildRoot}"
+            delete buildRoot
+        }
+        jniLibsRoot.eachDir { abiDir ->
+            def so = new File(abiDir, 'libsignal.so')
+            if (so.exists()) {
+                println "removing: ${so}"
+                delete so
+            }
+        }
+    }
+
+    finalizedBy 'buildNativeLibs'
 }
 
 tasks.configureEach { task ->

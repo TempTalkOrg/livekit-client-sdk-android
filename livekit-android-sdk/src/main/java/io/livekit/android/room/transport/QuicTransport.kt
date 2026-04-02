@@ -78,6 +78,8 @@ class QuicTransport(
             maxConnections = 1
             congestCtrl = Const.CC_BBR2
             pingOn = true
+            deviceType = options.quicDeviceType
+            cidTag = options.quicCidTag
             // alpn = "h3" //for webtransport
             alpn = "ttsignal" // for raw quic
         }
@@ -168,7 +170,7 @@ class QuicTransport(
 
         val host = url.replaceFirst("wss", "https")
         val props = authObject.toString()
-        LKLog.i { "[quic] connect: host=$host, props=$authObject, ${this@QuicTransport}" }
+        LKLog.i { "[quic] connect: host=$host, ${this@QuicTransport}" }
         this.connection?.connect(host, props, 7 * 1000)
     }
 

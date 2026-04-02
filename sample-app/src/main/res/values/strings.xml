@@ -5,9 +5,16 @@
     <string name="e2ee_key_str">E2EE Key</string>
     <string name="e2ee_enabled_str">Enable E2EE</string>
     <string name="quic_enabled_str">Enable Quic Signal</string>
+    <string name="quic_device_type_str">QUIC Device Type</string>
+    <string name="quic_cid_tag_str">QUIC CID Tag</string>
     <string name="url">URL</string>
     <string name="save_values">Save Values</string>
     <string name="reset_values">Reset Values</string>
     <string name="denoise_open">NS Open</string>
     <string name="denoise_close">NS Close</string>
+    <string name="ns_rnnoise">RNNoise</string>
+    <string name="ns_deepfilter">DeepFilter</string>
+    <string name="ns_off">NS Off</string>
+    <string name="df_atten_lim">Atten Limit (dB)</string>
+    <string name="df_post_filter">Post Filter Beta</string>
 </resources>

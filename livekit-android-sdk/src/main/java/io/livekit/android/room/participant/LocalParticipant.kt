@@ -1628,7 +1628,9 @@ internal constructor(
             // Video tracks cannot be published while muted, but audio tracks can be republished as a muted stream.
             val success = when (track) {
                 is LocalAudioTrack -> publishAudioTrack(track, pub.options as AudioTrackPublishOptions, null, pub.muted)
-                is LocalVideoTrack -> if (pub.muted) true else {
+                is LocalVideoTrack -> if (pub.muted) {
+                    true
+                } else {
                     publishVideoTrack(track, pub.options as VideoTrackPublishOptions, null)
                 }
 

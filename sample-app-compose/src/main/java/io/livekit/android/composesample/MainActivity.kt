@@ -33,6 +33,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.Button
 import androidx.compose.material.MaterialTheme
@@ -48,6 +49,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.google.accompanist.pager.ExperimentalPagerApi
@@ -71,7 +73,10 @@ class MainActivity : ComponentActivity() {
                 defaultToken = viewModel.getSavedToken(),
                 defaultE2eeKey = viewModel.getSavedE2EEKey(),
                 defaultE2eeOn = viewModel.getE2EEOptionsOn(),
-                onConnect = { url, token, e2eeKey, e2eeOn, stressTest ->
+                defaultQuicOn = viewModel.getQuicSignalOn(),
+                defaultQuicDeviceType = viewModel.getQuicDeviceType(),
+                defaultQuicCidTag = viewModel.getQuicCidTag(),
+                onConnect = { url, token, e2eeKey, e2eeOn, quicOn, quicDeviceType, quicCidTag, stressTest ->
                     val intent = Intent(this@MainActivity, CallActivity::class.java).apply {
                         putExtra(
                             CallActivity.KEY_ARGS,
@@ -80,17 +85,23 @@ class MainActivity : ComponentActivity() {
                                 token,
                                 e2eeKey,
                                 e2eeOn,
+                                quicOn,
+                                quicDeviceType,
+                                quicCidTag,
                                 stressTest,
                             ),
                         )
                     }
                     startActivity(intent)
                 },
-                onSave = { url, token, e2eeKey, e2eeOn ->
+                onSave = { url, token, e2eeKey, e2eeOn, quicOn, quicDeviceType, quicCidTag ->
                     viewModel.setSavedUrl(url)
                     viewModel.setSavedToken(token)
                     viewModel.setSavedE2EEKey(e2eeKey)
                     viewModel.setSavedE2EEOn(e2eeOn)
+                    viewModel.setQuicSignalOn(quicOn)
+                    viewModel.setQuicDeviceType(quicDeviceType)
+                    viewModel.setQuicCidTag(quicCidTag)
 
                     Toast.makeText(
                         this@MainActivity,
@@ -121,8 +132,28 @@ class MainActivity : ComponentActivity() {
         defaultSecondToken: String = MainViewModel.TOKEN,
         defaultE2eeKey: String = MainViewModel.E2EE_KEY,
         defaultE2eeOn: Boolean = false,
-        onConnect: (url: String, token: String, e2eeKey: String, e2eeOn: Boolean, stressTest: StressTest) -> Unit = { _, _, _, _, _ -> },
-        onSave: (url: String, token: String, e2eeKey: String, e2eeOn: Boolean) -> Unit = { _, _, _, _ -> },
+        defaultQuicOn: Boolean = false,
+        defaultQuicDeviceType: Int = MainViewModel.DEFAULT_QUIC_DEVICE_TYPE,
+        defaultQuicCidTag: String = MainViewModel.DEFAULT_QUIC_CID_TAG,
+        onConnect: (
+            url: String,
+            token: String,
+            e2eeKey: String,
+            e2eeOn: Boolean,
+            quicOn: Boolean,
+            quicDeviceType: Int,
+            quicCidTag: String,
+            stressTest: StressTest,
+        ) -> Unit = { _, _, _, _, _, _, _, _ -> },
+        onSave: (
+            url: String,
+            token: String,
+            e2eeKey: String,
+            e2eeOn: Boolean,
+            quicOn: Boolean,
+            quicDeviceType: Int,
+            quicCidTag: String,
+        ) -> Unit = { _, _, _, _, _, _, _ -> },
         onReset: () -> Unit = {},
     ) {
         AppTheme {
@@ -130,6 +161,9 @@ class MainActivity : ComponentActivity() {
             var token by remember { mutableStateOf(defaultToken) }
             var e2eeKey by remember { mutableStateOf(defaultE2eeKey) }
             var e2eeOn by remember { mutableStateOf(defaultE2eeOn) }
+            var quicOn by remember { mutableStateOf(defaultQuicOn) }
+            var quicDeviceType by remember { mutableStateOf(defaultQuicDeviceType.toString()) }
+            var quicCidTag by remember { mutableStateOf(defaultQuicCidTag) }
             var stressTest by remember { mutableStateOf(false) }
             var secondToken by remember { mutableStateOf(defaultSecondToken) }
             val scrollState = rememberScrollState()
@@ -203,6 +237,47 @@ class MainActivity : ComponentActivity() {
                             )
                         }
 
+                        Spacer(modifier = Modifier.height(20.dp))
+                        Row(
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text("Enable QUIC Signal")
+                            Switch(
+                                checked = quicOn,
+                                onCheckedChange = { quicOn = it },
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = "QUIC device type and CID tag (used when QUIC signal is enabled). Defaults from Gradle: livekitQuicDeviceType, livekitQuicCidTag.",
+                            style = MaterialTheme.typography.caption,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        OutlinedTextField(
+                            value = quicDeviceType,
+                            onValueChange = { value ->
+                                if (value.isEmpty() || value.all(Char::isDigit)) {
+                                    quicDeviceType = value
+                                }
+                            },
+                            label = { Text("QUIC Device Type") },
+                            modifier = Modifier.fillMaxWidth(),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        )
+
+                        Spacer(modifier = Modifier.height(20.dp))
+                        OutlinedTextField(
+                            value = quicCidTag,
+                            onValueChange = { quicCidTag = it },
+                            label = { Text("QUIC CID Tag") },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+
+                        Spacer(modifier = Modifier.height(20.dp))
                         Row(
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically,
@@ -223,14 +298,35 @@ class MainActivity : ComponentActivity() {
                                 } else {
                                     StressTest.None
                                 }
-                                onConnect(url, token, e2eeKey, e2eeOn, stressTestCmd)
+                                onConnect(
+                                    url,
+                                    token,
+                                    e2eeKey,
+                                    e2eeOn,
+                                    quicOn,
+                                    quicDeviceType.toIntOrNull() ?: 0,
+                                    quicCidTag,
+                                    stressTestCmd,
+                                )
                             },
                         ) {
                             Text("Connect")
                         }
 
                         Spacer(modifier = Modifier.height(20.dp))
-                        Button(onClick = { onSave(url, token, e2eeKey, e2eeOn) }) {
+                        Button(
+                            onClick = {
+                                onSave(
+                                    url,
+                                    token,
+                                    e2eeKey,
+                                    e2eeOn,
+                                    quicOn,
+                                    quicDeviceType.toIntOrNull() ?: MainViewModel.DEFAULT_QUIC_DEVICE_TYPE,
+                                    quicCidTag,
+                                )
+                            },
+                        ) {
                             Text("Save Values")
                         }
 
@@ -240,6 +336,12 @@ class MainActivity : ComponentActivity() {
                                 onReset()
                                 url = MainViewModel.URL
                                 token = MainViewModel.TOKEN
+                                e2eeKey = MainViewModel.E2EE_KEY
+                                e2eeOn = false
+                                quicOn = false
+                                quicDeviceType = MainViewModel.DEFAULT_QUIC_DEVICE_TYPE.toString()
+                                quicCidTag = MainViewModel.DEFAULT_QUIC_CID_TAG
+                                stressTest = false
                             },
                         ) {
                             Text("Reset Values")

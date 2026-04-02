@@ -1,7 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-GROUP="com.github.TempTalkOrg"
+get_property_from_gradle() {
+  local props_file="$1"
+  local key="$2"
+  if [[ ! -f "$props_file" ]]; then
+    echo ""
+    return
+  fi
+  grep "^${key}=" "$props_file" 2>/dev/null | cut -d'=' -f2- | tr -d '[:space:]' || true
+}
+
+GROUP=$(get_property_from_gradle "gradle.properties" "GROUP")
+[[ -z "$GROUP" ]] && { echo "Error: GROUP not found in gradle.properties"; exit 1; }
+
 MODULES=(
   "livekit-android"
   "livekit-android-camerax"
@@ -53,12 +65,7 @@ EOF
 }
 
 get_version_from_gradle() {
-  local props_file="$1"
-  if [[ ! -f "$props_file" ]]; then
-    echo ""
-    return
-  fi
-  grep '^VERSION_NAME=' "$props_file" 2>/dev/null | cut -d'=' -f2 | tr -d '[:space:]' || true
+  get_property_from_gradle "$1" "VERSION_NAME"
 }
 
 VERSION=""

@@ -1,5 +1,5 @@
 /*
- * Copyright 2023-2025 LiveKit, Inc.
+ * Copyright 2023-2026 LiveKit, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@ package io.livekit.android.test.mock.dagger
 
 import android.content.Context
 import android.javax.sdp.SdpFactory
-import org.difft.android.smp.Connector
 import dagger.Module
 import dagger.Provides
 import dagger.Reusable
@@ -38,13 +37,14 @@ import io.livekit.android.test.mock.MockEglBase
 import io.livekit.android.test.mock.e2ee.ReversingDataPacketCryptorManager
 import io.livekit.android.webrtc.PeerConnectionFactoryManager
 import io.livekit.android.webrtc.peerconnection.RTCThreadToken
-import org.mockito.kotlin.mock
 import livekit.org.webrtc.EglBase
 import livekit.org.webrtc.MediaStreamTrack
 import livekit.org.webrtc.MockPeerConnectionFactory
 import livekit.org.webrtc.PeerConnectionFactory
 import livekit.org.webrtc.WebRTCInitializer
 import livekit.org.webrtc.audio.AudioDeviceModule
+import org.difft.android.smp.Connector
+import org.mockito.kotlin.mock
 import javax.inject.Named
 import javax.inject.Singleton
 

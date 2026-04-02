@@ -48,7 +48,7 @@ dependencies {
     implementation "androidx.camera:camera-view:${camerax_version}"
     implementation "androidx.camera:camera-extensions:${camerax_version}"
     implementation(libs.denoise.filter) {
-        exclude group: 'com.github.TempTalkOrg', module: 'livekit-android'
+        exclude group: 'com.github.TempTalkOrg.livekit-client-sdk-android', module: 'livekit-android'
     }
     implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk7:$kotlin_version"
     implementation libs.coroutines.lib

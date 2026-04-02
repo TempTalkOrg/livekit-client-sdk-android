@@ -1156,14 +1156,14 @@ constructor(
     private val networkCallbackManager = networkCallbackManagerFactory.invoke(
         object : NetworkCallback() {
             override fun onLost(network: Network) {
-                LKLog.i { "network connection onLost, hasLostConnectivity=$hasLostConnectivity, network=[${network}]" }
+                LKLog.i { "network connection onLost, hasLostConnectivity=$hasLostConnectivity, network=[$network]" }
 
                 // lost connection, flip to reconnecting
                 hasLostConnectivity = true
             }
 
             override fun onAvailable(network: Network) {
-                LKLog.i { "network connection onAvailable, hasLostConnectivity=$hasLostConnectivity , network=[${network}]" }
+                LKLog.i { "network connection onAvailable, hasLostConnectivity=$hasLostConnectivity , network=[$network]" }
                 // only actually reconnect after connection is re-established
                 if (!hasLostConnectivity) {
                     return
@@ -1235,6 +1235,13 @@ constructor(
             return
         }
 
+        // When WebRTC reuses an RtpReceiver/MediaStreamTrack (same mid in SDP), the underlying
+        // rtcTrack object is identical across old and new participants. If the old participant's
+        // handleParticipantDisconnect runs after this point, its unpublishTrack -> track.stop()
+        // would call rtcTrack.setEnabled(false) on the shared rtcTrack, silencing the new
+        // participant's audio. Detach the rtcTrack from the old participant preemptively.
+        detachRtcTrackFromOtherParticipants(track, participantSid)
+
         val participant = getParticipantBySid(participantSid) as? RemoteParticipant
 
         if (participant == null) {
@@ -1250,6 +1257,27 @@ constructor(
             statsGetter = statsGetter,
             receiver = receiver,
         )
+    }
+
+    /**
+     * When WebRTC reuses a MediaStreamTrack (same SDP mid), the old participant may still hold
+     * a Track wrapping the same rtcTrack. Detach it so that the old participant's stop() won't
+     * disable the shared rtcTrack.
+     */
+    private fun detachRtcTrackFromOtherParticipants(rtcTrack: MediaStreamTrack, newParticipantSid: String) {
+        for ((_, participant) in remoteParticipants) {
+            if (participant.sid?.value == newParticipantSid) continue
+            for ((_, publication) in participant.trackPublications) {
+                val existingTrack = publication.track ?: continue
+                if (existingTrack.rtcTrack === rtcTrack) {
+                    LKLog.w {
+                        "rtcTrack ${rtcTrack.id()} reused: detaching from old participant ${participant.sid} " +
+                            "publication ${publication.sid} before assigning to new participant $newParticipantSid"
+                    }
+                    publication.track = null
+                }
+            }
+        }
     }
 
     /**

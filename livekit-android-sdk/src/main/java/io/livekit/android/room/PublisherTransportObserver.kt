@@ -1,5 +1,5 @@
 /*
- * Copyright 2023-2025 LiveKit, Inc.
+ * Copyright 2023-2026 LiveKit, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -80,7 +80,7 @@ internal class PublisherTransportObserver(
     override fun onConnectionChange(newState: PeerConnection.PeerConnectionState) {
         executeOnRTCThread(rtcThreadToken) {
             LKLog.i { "[$observerTag] onConnection new state: $newState" }
-            connectionChangeListener?.invoke(newState,observerTag)
+            connectionChangeListener?.invoke(newState, observerTag)
             connectionState = newState
         }
     }

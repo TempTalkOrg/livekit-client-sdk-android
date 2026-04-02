@@ -63,6 +63,18 @@ data class ConnectOptions(
      * Use ttsignal for transport, defaults to false
      */
     val useQuicSignal: Boolean = false,
+
+    /**
+     * Device type for QUIC signaling, where 1 = phone and 2 = PC.
+     * Only used when [useQuicSignal] is true.
+     */
+    val quicDeviceType: Int = 0,
+
+    /**
+     * CID tag for QUIC signaling.
+     * Only used when [useQuicSignal] is true.
+     */
+    val quicCidTag: String = "",
 ) {
     internal var reconnect: Boolean = false
     internal var participantSid: String? = null

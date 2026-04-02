@@ -26,6 +26,15 @@ plugins {
     id("io.github.gradle-nexus.publish-plugin") version "2.0.0"
 }
 
+apply plugin: "com.diffplug.spotless"
+spotless {
+    predeclareDeps()
+}
+spotlessPredeclare {
+    java { googleJavaFormat("1.18.1").aosp().reflowLongStrings() }
+    kotlin { ktlint("0.50.0") }
+}
+
 subprojects {
     // Ignore examples folder, it's not a module itself.
     if (project.name == "examples") {
@@ -48,7 +57,7 @@ subprojects {
         }
         java {
             // apply a specific flavor of google-java-format
-            googleJavaFormat('1.17.0').aosp().reflowLongStrings()
+            googleJavaFormat('1.18.1').aosp().reflowLongStrings()
             // fix formatting of type annotations
             formatAnnotations()
             // make sure every file has the following copyright header.
@@ -65,6 +74,7 @@ subprojects {
                 "src/*/java/**/TextureViewRenderer.kt", // Different license
                 "src/*/java/**/FlowDelegate.kt", // Different license
                 "src/*/java/**/JainSdpUtils.kt", // Different license
+                "**/org/example/ttsignal/MainActivity.kt", // Long URLs/tokens in submodule
             )
             ktlint("0.50.0")
                 .setEditorConfigPath("$rootDir/.editorconfig")
@@ -84,10 +94,6 @@ subprojects {
         }
     }
 
-}
-
-tasks.register('clean', Delete) {
-    delete rootProject.buildDir
 }
 
 group = GROUP

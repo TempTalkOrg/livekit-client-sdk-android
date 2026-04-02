@@ -196,6 +196,7 @@ internal object RTCModule {
         config.maxConnections = 1000
         config.congestCtrl = Const.CC_BBR2
         config.pingOn = true
+        config.numOfSenders = 2
         config.logLevel = LiveKit.loggingLevelQuic.toQuicLogLevel()
         config.logHandler = Config.LogHandler { level, msg ->
             val loggingLevel = fromQuicLogLevel(level)
@@ -208,7 +209,6 @@ internal object RTCModule {
             } catch (t: Throwable) {
                 // do nothing
             }
-
         }
         return Connector(config)
     }

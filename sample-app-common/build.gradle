@@ -37,6 +37,14 @@ def getOpenCamera() {
     return hasProperty('livekitOpenCamera') ? livekitOpenCamera.toBoolean() : false
 }
 
+def getQuicDeviceType() {
+    return hasProperty('livekitQuicDeviceType') ? livekitQuicDeviceType.toInteger() : 0
+}
+
+def getQuicCidTag() {
+    return hasProperty('livekitQuicCidTag') ? livekitQuicCidTag.replace('"', '\\"') : ""
+}
+
 
 final url = getDefaultUrl().strip()
 final token = getDefaultToken().strip()
@@ -46,6 +54,8 @@ final enableDeviceRotation = getEnableDeviceRotation()
 final openMicrophone = getOpenMicrophone()
 final microphonePublishMute = getMicrophonePublishMute()
 final openCamera = getOpenCamera()
+final quicDeviceType = getQuicDeviceType()
+final quicCidTag = getQuicCidTag()
 
 android {
     namespace "io.livekit.android.sample.common"
@@ -72,6 +82,8 @@ android {
             buildConfigField "boolean", "OPEN_MICROPHONE", openMicrophone.toString()
             buildConfigField "boolean", "MICROPHONE_PUBLISH_MUTE", microphonePublishMute.toString()
             buildConfigField "boolean", "OPEN_CAMERA", openCamera.toString()
+            buildConfigField "int", "DEFAULT_QUIC_DEVICE_TYPE", "${quicDeviceType}"
+            buildConfigField "String", "DEFAULT_QUIC_CID_TAG", "\"${quicCidTag}\""
         }
 
         debug {
@@ -83,6 +95,8 @@ android {
             buildConfigField "boolean", "OPEN_MICROPHONE", openMicrophone.toString()
             buildConfigField "boolean", "MICROPHONE_PUBLISH_MUTE", microphonePublishMute.toString()
             buildConfigField "boolean", "OPEN_CAMERA", openCamera.toString()
+            buildConfigField "int", "DEFAULT_QUIC_DEVICE_TYPE", "${quicDeviceType}"
+            buildConfigField "String", "DEFAULT_QUIC_CID_TAG", "\"${quicCidTag}\""
         }
     }
     buildFeatures {

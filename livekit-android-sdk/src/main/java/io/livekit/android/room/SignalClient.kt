@@ -385,9 +385,14 @@ constructor(
             return
         }
         val byteArray = message.toByteArray()
-        val signalResponseBuilder = LivekitRtc.SignalResponse.newBuilder()
-            .mergeFrom(byteArray)
-        val response = signalResponseBuilder.build()
+        val response = try {
+            LivekitRtc.SignalResponse.newBuilder()
+                .mergeFrom(byteArray)
+                .build()
+        } catch (e: com.google.protobuf.InvalidProtocolBufferException) {
+            LKLog.w(e) { "Failed to parse SignalResponse, discarding malformed message." }
+            return
+        }
 
         handleSignalResponse(transport, response)
     }

@@ -36,7 +36,82 @@
         android:id="@+id/audience_row"
         android:layout_width="match_parent"
         android:layout_height="120dp"
-        app:layout_constraintBottom_toTopOf="@id/controls_box" />
+        app:layout_constraintBottom_toTopOf="@id/df_config_panel" />
+
+    <LinearLayout
+        android:id="@+id/df_config_panel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:background="#99000000"
+        android:paddingHorizontal="16dp"
+        android:paddingVertical="8dp"
+        android:visibility="gone"
+        app:layout_constraintBottom_toTopOf="@id/controls_box">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/df_atten_lim"
+                android:textColor="@android:color/white"
+                android:textSize="12sp" />
+
+            <TextView
+                android:id="@+id/atten_lim_value"
+                android:layout_width="48dp"
+                android:layout_height="wrap_content"
+                android:text="100"
+                android:textColor="@android:color/white"
+                android:textSize="12sp"
+                android:gravity="end" />
+        </LinearLayout>
+
+        <SeekBar
+            android:id="@+id/atten_lim_slider"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:max="100"
+            android:progress="100" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:layout_marginTop="4dp">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/df_post_filter"
+                android:textColor="@android:color/white"
+                android:textSize="12sp" />
+
+            <TextView
+                android:id="@+id/post_filter_value"
+                android:layout_width="48dp"
+                android:layout_height="wrap_content"
+                android:text="0.00"
+                android:textColor="@android:color/white"
+                android:textSize="12sp"
+                android:gravity="end" />
+        </LinearLayout>
+
+        <SeekBar
+            android:id="@+id/post_filter_slider"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:max="100"
+            android:progress="0" />
+    </LinearLayout>
 
     <LinearLayout
         android:id="@+id/controls_box"
@@ -134,6 +209,17 @@
             android:text="@string/denoise_open"
             android:background="?android:attr/selectableItemBackground"
             android:textColor="@android:color/white"
+            app:tint="@android:color/white"/>
+
+        <Button
+            android:id="@+id/model_switch"
+            android:layout_width="@dimen/control_size"
+            android:layout_height="@dimen/control_size"
+            android:layout_weight="1"
+            android:text="@string/ns_rnnoise"
+            android:background="?android:attr/selectableItemBackground"
+            android:textColor="@android:color/white"
+            android:textSize="10sp"
             app:tint="@android:color/white"/>
 
         <ImageView

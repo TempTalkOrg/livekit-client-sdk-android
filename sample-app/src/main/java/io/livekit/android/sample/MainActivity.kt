@@ -47,13 +47,23 @@ class MainActivity : AppCompatActivity() {
         val tokenString = viewModel.getSavedToken()
         val e2EEOn = viewModel.getE2EEOptionsOn()
         val e2EEKey = viewModel.getSavedE2EEKey()
+        val quicOn = viewModel.getQuicSignalOn()
+        val savedQuicDeviceType = viewModel.getQuicDeviceType()
+        val savedQuicCidTag = viewModel.getQuicCidTag()
 
         binding.run {
             urlDropdown.setText(urlString, false)
             token.editText?.text = SpannableStringBuilder(tokenString)
             e2eeEnabled.isChecked = e2EEOn
             e2eeKey.editText?.text = SpannableStringBuilder(e2EEKey)
+            quicEnabled.isChecked = quicOn
+            quicDeviceType.editText?.text = SpannableStringBuilder(savedQuicDeviceType.toString())
+            quicCidTag.editText?.text = SpannableStringBuilder(savedQuicCidTag)
             connectButton.setOnClickListener {
+                val quicDeviceTypeInt =
+                    quicDeviceType.editText?.text?.toString()?.toIntOrNull()
+                        ?: MainViewModel.DEFAULT_QUIC_DEVICE_TYPE
+                val quicCidTagStr = quicCidTag.editText?.text?.toString().orEmpty()
                 val intent = Intent(this@MainActivity, CallActivity::class.java).apply {
                     putExtra(
                         CallActivity.KEY_ARGS,
@@ -63,6 +73,8 @@ class MainActivity : AppCompatActivity() {
                             e2eeOn = e2eeEnabled.isChecked,
                             e2eeKey = e2eeKey.editText?.text.toString(),
                             quicOn = quicEnabled.isChecked,
+                            quicDeviceType = quicDeviceTypeInt,
+                            quicCidTag = quicCidTagStr,
                             stressTest = StressTest.None,
                         ),
                     )
@@ -76,6 +88,12 @@ class MainActivity : AppCompatActivity() {
                 viewModel.setSavedToken(token.editText?.text?.toString() ?: "")
                 viewModel.setSavedE2EEOn(e2eeEnabled.isChecked)
                 viewModel.setSavedE2EEKey(e2eeKey.editText?.text?.toString() ?: "")
+                viewModel.setQuicSignalOn(quicEnabled.isChecked)
+                viewModel.setQuicDeviceType(
+                    quicDeviceType.editText?.text?.toString()?.toIntOrNull()
+                        ?: MainViewModel.DEFAULT_QUIC_DEVICE_TYPE,
+                )
+                viewModel.setQuicCidTag(quicCidTag.editText?.text?.toString().orEmpty())
 
                 Toast.makeText(
                     this@MainActivity,
@@ -90,6 +108,10 @@ class MainActivity : AppCompatActivity() {
                 token.editText?.text = SpannableStringBuilder(MainViewModel.TOKEN)
                 e2eeEnabled.isChecked = false
                 e2eeKey.editText?.text = SpannableStringBuilder("")
+                quicEnabled.isChecked = false
+                quicDeviceType.editText?.text =
+                    SpannableStringBuilder(MainViewModel.DEFAULT_QUIC_DEVICE_TYPE.toString())
+                quicCidTag.editText?.text = SpannableStringBuilder(MainViewModel.DEFAULT_QUIC_CID_TAG)
 
                 Toast.makeText(
                     this@MainActivity,
