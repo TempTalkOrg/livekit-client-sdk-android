@@ -1,5 +1,5 @@
 /*
- * Copyright 2025-2026 LiveKit, Inc.
+ * Copyright 2026 LiveKit, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,16 +16,13 @@
 
 package io.livekit.android.sample
 
-import android.app.Application
-import io.livekit.android.LiveKit
-import io.livekit.android.util.LoggingLevel
-
-class SampleApplication : Application() {
-    override fun onCreate() {
-        super.onCreate()
-        LiveKit.init(this)
-        LiveKit.loggingLevel = LoggingLevel.VERBOSE
-        //  LiveKit.enableWebRTCLogging = true
-        //  LiveKit.loggingLevelWebRTC = LoggingLevel.DEBUG
-    }
-}
+@kotlinx.serialization.Serializable
+data class ConnectionPreset(
+    val id: String,
+    val label: String,
+    val url: String,
+    val token: String,
+    val useQuicSignal: Boolean = false,
+    val serverHost: String = "",
+    val caCertPem: String = "",
+)

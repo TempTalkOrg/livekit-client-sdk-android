@@ -52,8 +52,9 @@ import io.livekit.android.room.track.LocalScreencastVideoTrack
 import io.livekit.android.room.track.LocalVideoTrack
 import io.livekit.android.room.track.LocalVideoTrackOptions
 import io.livekit.android.room.track.Track
+import io.livekit.android.room.track.VideoCaptureParameter
 import io.livekit.android.room.track.VideoCodec
-import io.livekit.android.room.track.VideoEncoding
+import io.livekit.android.room.track.VideoPreset169
 import io.livekit.android.room.track.screencapture.ScreenCaptureParams
 import io.livekit.android.room.track.video.CameraCapturerUtils
 import io.livekit.android.sample.common.BuildConfig
@@ -129,6 +130,8 @@ class CallViewModel(
     val quic: Boolean = false,
     val quicDeviceType: Int = 0,
     val quicCidTag: String = "",
+    val serverHost: String = "",
+    val caCertPem: String = "",
     val audioProcessorOptions: AudioProcessorOptions? = null,
     val stressTest: StressTest = StressTest.None,
 ) : AndroidViewModel(application) {
@@ -150,6 +153,8 @@ class CallViewModel(
                 useQuicSignal = quic,
                 quicDeviceType = quicDeviceType,
                 quicCidTag = quicCidTag,
+                serverHost = serverHost.ifEmpty { null },
+                caCertPem = caCertPem.ifEmpty { null },
             )
         }
         val param = Json.decodeFromString<MergeStartCallParam>(BuildConfig.MERGE_START_CALL_PARAM)
@@ -197,6 +202,8 @@ class CallViewModel(
             useQuicSignal = quic,
             quicDeviceType = quicDeviceType,
             quicCidTag = quicCidTag,
+            serverHost = serverHost.ifEmpty { null },
+            caCertPem = caCertPem.ifEmpty { null },
         )
     }
 
@@ -215,11 +222,13 @@ class CallViewModel(
             videoTrackCaptureDefaults = LocalVideoTrackOptions(
                 deviceId = "",
                 position = CameraPosition.FRONT,
-                isPortrait = true,
+                captureParams = VideoCaptureParameter(1280, 720, 30),
+                isPortrait = true // Set portrait mode for vertical video capture orientation
             ),
             videoTrackPublishDefaults = VideoTrackPublishDefaults(
-                videoEncoding = VideoEncoding(3_000_000, 30),
-                videoCodec = VideoCodec.VP8.codecName,
+                videoEncoding = VideoPreset169.H1080.encoding,
+                videoCodec = VideoCodec.VP9.codecName,
+                scalabilityMode = "L3T3"
             ),
         )
     }
@@ -409,7 +418,7 @@ class CallViewModel(
                         }
 
                         else -> {
-                            LKLog.e { "Room event: $it" }
+                            LKLog.i { "Room event: $it" }
                         }
                     }
                 }
@@ -500,6 +509,7 @@ class CallViewModel(
             // Update the speaker
             handlePrimarySpeaker(emptyList(), emptyList(), room)
         } catch (e: Throwable) {
+            LKLog.e { "Failed to connect to room, error=$e.message" }
             mutableError.value = e
             mutableConnectionStatus.value = "Failed to connect"
         }

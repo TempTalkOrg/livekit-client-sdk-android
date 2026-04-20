@@ -17,16 +17,24 @@
 package io.livekit.android.room.transport
 
 import io.livekit.android.ConnectOptions
+import io.livekit.android.util.LKLog
+import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
+import java.io.ByteArrayInputStream
+import java.security.KeyStore
+import java.security.cert.CertificateFactory
+import javax.net.ssl.SSLContext
+import javax.net.ssl.TrustManagerFactory
+import javax.net.ssl.X509TrustManager
 
 class WebSocketTransport(
     override val attemptId: Long,
     override val sendOnOpen: ByteString?,
-    private val websocketFactory: WebSocket.Factory,
+    private val okHttpClient: OkHttpClient,
 ) : SignalTransport, WebSocketListener() {
 
     private var ws: WebSocket? = null
@@ -40,6 +48,8 @@ class WebSocketTransport(
     ) {
         this.listener = listener
 
+        val client = configureClient(options)
+
         val requestBuilder = Request.Builder()
             .url(url)
             .addHeader("Authorization", "Bearer $token")
@@ -51,7 +61,59 @@ class WebSocketTransport(
         }
 
         val request = requestBuilder.build()
-        ws = websocketFactory.newWebSocket(request, this@WebSocketTransport)
+        ws = client.newWebSocket(request, this@WebSocketTransport)
+    }
+
+    /**
+     * Returns an [OkHttpClient] configured for self-signed certificate verification
+     * when [ConnectOptions.caCertPem] is provided.
+     *
+     * A custom [X509TrustManager] is built that trusts only the given root CA(s).
+     * If the PEM is malformed, falls back to the unmodified [okHttpClient] so that
+     * the connection can still attempt (and fail with a clear TLS error) rather
+     * than crashing.
+     */
+    private fun configureClient(options: ConnectOptions): OkHttpClient {
+        val caCertPem = options.caCertPem
+        if (caCertPem.isNullOrEmpty()) {
+            return okHttpClient
+        }
+
+        val trustManager = try {
+            buildTrustManager(caCertPem)
+        } catch (e: Exception) {
+            LKLog.e(e) { "Failed to parse caCertPem, falling back to default trust store." }
+            return okHttpClient
+        }
+
+        val sslContext = SSLContext.getInstance("TLS")
+        sslContext.init(null, arrayOf(trustManager), null)
+
+        return okHttpClient.newBuilder()
+            .sslSocketFactory(sslContext.socketFactory, trustManager)
+            .build()
+    }
+
+    /**
+     * @throws java.security.cert.CertificateException if [caCertPem] is malformed.
+     * @throws IllegalStateException if the platform TrustManagerFactory yields no [X509TrustManager].
+     */
+    private fun buildTrustManager(caCertPem: String): X509TrustManager {
+        val certFactory = CertificateFactory.getInstance("X.509")
+        val certs = certFactory.generateCertificates(
+            ByteArrayInputStream(caCertPem.toByteArray(Charsets.UTF_8)),
+        )
+        require(certs.isNotEmpty()) { "caCertPem did not contain any valid certificates." }
+
+        val keyStore = KeyStore.getInstance(KeyStore.getDefaultType())
+        keyStore.load(null, null)
+        certs.forEachIndexed { i, cert -> keyStore.setCertificateEntry("ca$i", cert) }
+
+        val tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
+        tmf.init(keyStore)
+
+        return tmf.trustManagers.filterIsInstance<X509TrustManager>().firstOrNull()
+            ?: throw IllegalStateException("No X509TrustManager found from TrustManagerFactory.")
     }
 
     override fun send(data: ByteString): Boolean {

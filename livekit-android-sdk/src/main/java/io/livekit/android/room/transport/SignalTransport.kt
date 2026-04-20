@@ -46,6 +46,7 @@ interface SignalTransport {
         fun onClosed(transport: SignalTransport, code: Int, reason: String)
         fun onClosing(transport: SignalTransport, code: Int, reason: String)
         fun onFailure(transport: SignalTransport, t: Throwable, response: Response?)
+        fun onRestarted(transport: SignalTransport, result: Int, address: String?) {}
     }
 
     /**
@@ -79,4 +80,13 @@ interface SignalTransport {
      * messages.
      */
     fun cancel()
+
+    /**
+     * Requests the underlying transport to migrate to a new network path without
+     * tearing down the connection. Only meaningful for QUIC-based transports;
+     * the default implementation is a no-op.
+     *
+     * @param networkHandle the [android.net.Network.getNetworkHandle] of the new network.
+     */
+    fun restart(networkHandle: Long) { /* no-op for non-QUIC transports */ }
 }

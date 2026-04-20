@@ -1,6 +1,7 @@
 [versions]
-webrtc = "137.7151.05"
-denoiseFilter = "1.0.16"
+webrtc = "144.7559.01"
+
+denoiseFilter = "1.1.0"
 
 androidJainSipRi = "1.3.0-91"
 androidx-activity = "1.9.0"

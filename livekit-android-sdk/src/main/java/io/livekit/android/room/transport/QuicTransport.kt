@@ -80,8 +80,9 @@ class QuicTransport(
             pingOn = true
             deviceType = options.quicDeviceType
             cidTag = options.quicCidTag
-            // alpn = "h3" //for webtransport
-            alpn = "ttsignal" // for raw quic
+            serverHost = options.serverHost ?: ""
+            caCertPem = options.caCertPem ?: ""
+            alpn = if (options.caCertPem != null) "ttsignal-ip" else "ttsignal"
         }
 
         val connectionHandler = object : IConnectionHandler {
@@ -132,6 +133,9 @@ class QuicTransport(
 
             override fun onRestart(conn: Connection?, result: Int, address: String?) {
                 LKLog.i { "[quic] Restart result: $result, address: $address, ${this@QuicTransport}" }
+                executeOnListenerThread {
+                    listener.onRestarted(this@QuicTransport, result, address)
+                }
             }
 
             override fun onClosed(conn: Connection?, reason: String?) {
@@ -199,6 +203,14 @@ class QuicTransport(
                 connection?.close()
                 cleanup()
             }
+        }
+    }
+
+    override fun restart(networkHandle: Long) {
+        synchronized(lock) {
+            val conn = connection ?: return
+            LKLog.i { "[quic] restart with networkHandle=$networkHandle, ${this@QuicTransport}" }
+            conn.restart(networkHandle)
         }
     }
 

@@ -5,57 +5,78 @@ plugins {
     id 'kotlinx-serialization'
 }
 
-def getDefaultUrl() {
-    return hasProperty('livekitSampleUrl') ? livekitSampleUrl : "ws://www.example.com"
+// ---------------------------------------------------------------------------
+// Read local config from tt.json (gitignored).
+// Falls back to gradle.properties for each setting if tt.json is absent.
+// ---------------------------------------------------------------------------
+def ttConfigFile = rootProject.file('local-config.json')
+def ttParsed = ttConfigFile.exists() ? new groovy.json.JsonSlurper().parse(ttConfigFile) : null
+
+// Support both formats: bare array of presets (legacy) or { presets, settings }
+def ttPresets = (ttParsed instanceof List) ? ttParsed : (ttParsed?.presets ?: null)
+def ttSettings = (ttParsed instanceof List || ttParsed == null) ? [:] : (ttParsed?.settings ?: [:])
+
+// --- Derive BuildConfig values (tt.json > gradle.properties > hardcoded default) ---
+
+final url = (ttPresets != null && !ttPresets.isEmpty()
+    ? ttPresets[0].url
+    : (hasProperty('livekitSampleUrl') ? livekitSampleUrl : "ws://www.example.com")
+).toString().strip()
+
+final token = (ttPresets != null && !ttPresets.isEmpty()
+    ? ttPresets[0].token
+    : (hasProperty('livekitSampleToken') ? livekitSampleToken : "")
+).toString().strip()
+
+final useMergeStartCall = ttSettings.containsKey('useMergeStartCall')
+    ? (ttSettings.useMergeStartCall as boolean)
+    : (hasProperty('livekitUseMergeStartCall') ? livekitUseMergeStartCall.toBoolean() : false)
+
+def mergeStartCallParamRaw
+if (ttSettings.containsKey('mergeStartCallParam') && ttSettings.mergeStartCallParam != null) {
+    mergeStartCallParamRaw = groovy.json.JsonOutput.toJson(ttSettings.mergeStartCallParam)
+} else if (hasProperty('livekitMergeStartCallParam')) {
+    mergeStartCallParamRaw = livekitMergeStartCallParam
+} else {
+    mergeStartCallParamRaw = ""
 }
+final mergeStartCallParam = mergeStartCallParamRaw.replace('"', '\\"').strip()
 
-def getDefaultToken() {
-    return hasProperty('livekitSampleToken') ? livekitSampleToken : ""
+final enableDeviceRotation = ttSettings.containsKey('enableDeviceRotation')
+    ? (ttSettings.enableDeviceRotation as boolean)
+    : (hasProperty('livekitEnableDeviceRotation') ? livekitEnableDeviceRotation.toBoolean() : false)
+
+final openMicrophone = ttSettings.containsKey('openMicrophone')
+    ? (ttSettings.openMicrophone as boolean)
+    : (hasProperty('livekitOpenMicrophone') ? livekitOpenMicrophone.toBoolean() : false)
+
+final microphonePublishMute = ttSettings.containsKey('microphonePublishMute')
+    ? (ttSettings.microphonePublishMute as boolean)
+    : (hasProperty('livekitMicrophonePublishMute') ? livekitMicrophonePublishMute.toBoolean() : false)
+
+final openCamera = ttSettings.containsKey('openCamera')
+    ? (ttSettings.openCamera as boolean)
+    : (hasProperty('livekitOpenCamera') ? livekitOpenCamera.toBoolean() : false)
+
+final quicDeviceType = ttSettings.containsKey('quicDeviceType')
+    ? (ttSettings.quicDeviceType as int)
+    : (hasProperty('livekitQuicDeviceType') ? livekitQuicDeviceType.toInteger() : 0)
+
+final quicCidTag = (ttSettings.containsKey('quicCidTag')
+    ? ttSettings.quicCidTag.toString()
+    : (hasProperty('livekitQuicCidTag') ? livekitQuicCidTag : "")
+).replace('"', '\\"')
+
+// --- Presets JSON ---
+def presetsJsonRaw
+if (ttPresets != null) {
+    presetsJsonRaw = groovy.json.JsonOutput.toJson(ttPresets)
+} else {
+    presetsJsonRaw = "[{\"id\":\"default\",\"label\":\"Default\",\"url\":\"${url}\",\"token\":\"${token}\",\"useQuicSignal\":false,\"serverHost\":\"\",\"caCertPem\":\"\"}]"
 }
+final presetsJson = presetsJsonRaw.replace('\\', '\\\\').replace('"', '\\"')
 
-def getUseMergeStartCall() {
-    return hasProperty('livekitUseMergeStartCall') ? livekitUseMergeStartCall.toBoolean() : false
-}
-
-def getMergeStartCallParam() {
-    return hasProperty('livekitMergeStartCallParam') ? livekitMergeStartCallParam.replace('"', '\\"') : ""
-}
-
-def getEnableDeviceRotation() {
-    return hasProperty('livekitEnableDeviceRotation') ? livekitEnableDeviceRotation.toBoolean() : false
-}
-
-def getOpenMicrophone() {
-    return hasProperty('livekitOpenMicrophone') ? livekitOpenMicrophone.toBoolean() : false
-}
-
-def getMicrophonePublishMute() {
-    return hasProperty('livekitMicrophonePublishMute') ? livekitMicrophonePublishMute.toBoolean() : false
-}
-
-def getOpenCamera() {
-    return hasProperty('livekitOpenCamera') ? livekitOpenCamera.toBoolean() : false
-}
-
-def getQuicDeviceType() {
-    return hasProperty('livekitQuicDeviceType') ? livekitQuicDeviceType.toInteger() : 0
-}
-
-def getQuicCidTag() {
-    return hasProperty('livekitQuicCidTag') ? livekitQuicCidTag.replace('"', '\\"') : ""
-}
-
-
-final url = getDefaultUrl().strip()
-final token = getDefaultToken().strip()
-final useMergeStartCall = getUseMergeStartCall()
-final mergeStartCallParam = getMergeStartCallParam().strip()
-final enableDeviceRotation = getEnableDeviceRotation()
-final openMicrophone = getOpenMicrophone()
-final microphonePublishMute = getMicrophonePublishMute()
-final openCamera = getOpenCamera()
-final quicDeviceType = getQuicDeviceType()
-final quicCidTag = getQuicCidTag()
+// ---------------------------------------------------------------------------
 
 android {
     namespace "io.livekit.android.sample.common"
@@ -84,6 +105,7 @@ android {
             buildConfigField "boolean", "OPEN_CAMERA", openCamera.toString()
             buildConfigField "int", "DEFAULT_QUIC_DEVICE_TYPE", "${quicDeviceType}"
             buildConfigField "String", "DEFAULT_QUIC_CID_TAG", "\"${quicCidTag}\""
+            buildConfigField "String", "SAMPLE_PRESETS_JSON", "\"${presetsJson}\""
         }
 
         debug {
@@ -97,6 +119,7 @@ android {
             buildConfigField "boolean", "OPEN_CAMERA", openCamera.toString()
             buildConfigField "int", "DEFAULT_QUIC_DEVICE_TYPE", "${quicDeviceType}"
             buildConfigField "String", "DEFAULT_QUIC_CID_TAG", "\"${quicCidTag}\""
+            buildConfigField "String", "SAMPLE_PRESETS_JSON", "\"${presetsJson}\""
         }
     }
     buildFeatures {

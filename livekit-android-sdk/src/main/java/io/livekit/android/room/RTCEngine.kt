@@ -29,6 +29,9 @@ import io.livekit.android.e2ee.E2EEManager
 import io.livekit.android.e2ee.EncryptedPacket
 import io.livekit.android.events.DisconnectReason
 import io.livekit.android.events.convert
+import io.livekit.android.room.network.DefaultReconnectPolicy
+import io.livekit.android.room.network.ReconnectContext
+import io.livekit.android.room.network.ReconnectPolicy
 import io.livekit.android.room.participant.Participant
 import io.livekit.android.room.participant.ParticipantTrackPermission
 import io.livekit.android.room.track.TrackException
@@ -56,6 +59,7 @@ import io.livekit.android.webrtc.peerconnection.RTCThreadToken
 import io.livekit.android.webrtc.peerconnection.executeBlockingOnRTCThread
 import io.livekit.android.webrtc.peerconnection.launchBlockingOnRTCThread
 import io.livekit.android.webrtc.toProtoSessionDescription
+import kotlinx.coroutines.CancellableContinuation
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -98,6 +102,7 @@ import javax.inject.Singleton
 import kotlin.coroutines.Continuation
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 /**
@@ -141,7 +146,7 @@ internal constructor(
             ConnectionState.DISCONNECTED -> {
                 LKLog.d { "primary ICE disconnected" }
                 if (oldVal == ConnectionState.CONNECTED) {
-                    reconnect()
+                    listener?.onEngineConnectionLost("primary ICE disconnected")
                 }
             }
 
@@ -155,7 +160,15 @@ internal constructor(
     private var reconnectingJob: Job? = null
 
     @Volatile
+    private var pendingNetworkHandle: Long = 0
+
+    @Volatile
+    private var restartContinuation: CancellableContinuation<Boolean>? = null
+
+    @Volatile
     private var fullReconnectOnNext = false
+
+    internal var reconnectPolicy: ReconnectPolicy = DefaultReconnectPolicy()
 
     private val pendingTrackResolvers: MutableMap<String, Continuation<LivekitModels.TrackInfo>> =
         mutableMapOf()
@@ -257,9 +270,9 @@ internal constructor(
             connectionState = ConnectionState.CONNECTING
         }
 
-        LKLog.i { "[track-reconnect] joinImpl signal connect in." }
+        LKLog.i { "[reconnect][signal] joinImpl signal connect in." }
         val joinResponse = client.join(url, token, options, roomOptions)
-        LKLog.i { "[track-reconnect] joinImpl signal connect out." }
+        LKLog.i { "[reconnect][signal] joinImpl signal connect out." }
         ensureActive()
 
         listener?.onJoinResponse(joinResponse)
@@ -276,7 +289,7 @@ internal constructor(
         }
         client.onReadyForResponses()
 
-        LKLog.i { "[track-reconnect] joinImpl out." }
+        LKLog.i { "[reconnect][signal] joinImpl out." }
 
         return@coroutineScope joinResponse
     }
@@ -349,7 +362,7 @@ internal constructor(
                         if (newState.isDisconnected()) {
                             val tagL = "listener${Integer.toHexString(System.identityHashCode(this))}"
                             LKLog.i { "[$tagL, $tag] publisher disconnected" }
-                            reconnect()
+                            listener?.onEngineConnectionLost("publisher disconnected")
                         }
                     }
                 } else {
@@ -529,38 +542,100 @@ internal constructor(
         }
     }
 
+    override fun onTransportRestarted(result: Int, address: String?) {
+        LKLog.i { "[reconnect][quic] callback received, result=$result, address=$address" }
+        val continuation = restartContinuation
+        if (continuation == null) {
+            LKLog.i { "[reconnect][quic] callback ignored: no pending restart continuation" }
+            return
+        }
+        restartContinuation = null
+        continuation.resume(result == 0)
+    }
+
+    private suspend fun tryQuicRestart(networkHandle: Long): Boolean {
+        LKLog.i {
+            "[reconnect][quic] requested, networkHandle=$networkHandle, clientConnected=${client.isConnected}"
+        }
+        val result = withTimeoutOrNull(3000L) {
+            suspendCancellableCoroutine { cont ->
+                restartContinuation = cont
+                client.restartTransport(networkHandle)
+                cont.invokeOnCancellation {
+                    if (restartContinuation === cont) {
+                        restartContinuation = null
+                    }
+                }
+            }
+        }
+        if (result == null) {
+            if (restartContinuation != null) {
+                restartContinuation = null
+            }
+            LKLog.w { "[reconnect][quic] timeout waiting for restart callback, networkHandle=$networkHandle" }
+            return false
+        }
+        return result
+    }
+
+    private fun negotiatePublisherIceRestart() {
+        if (!client.isConnected) {
+            return
+        }
+        coroutineScope.launch {
+            negotiatePublisherMutex.withLock {
+                val constraints = MediaConstraints().apply {
+                    with(mandatory) {
+                        add(MediaConstraints.KeyValuePair(MediaConstraintKeys.OFFER_TO_RECV_AUDIO, MediaConstraintKeys.FALSE))
+                        add(MediaConstraints.KeyValuePair(MediaConstraintKeys.OFFER_TO_RECV_VIDEO, MediaConstraintKeys.FALSE))
+                        add(MediaConstraints.KeyValuePair(MediaConstraintKeys.ICE_RESTART, MediaConstraintKeys.TRUE))
+                    }
+                }
+                publisher?.negotiate?.invoke(constraints)
+            }
+        }
+    }
+
     /**
      * reconnect Signal and PeerConnections
      */
     @Synchronized
     @VisibleForTesting(otherwise = VisibleForTesting.PACKAGE_PRIVATE)
-    fun reconnect() {
+    fun reconnect(networkHandle: Long = 0, reason: String = "unspecified") {
+        LKLog.i {
+            "[reconnect][net] reconnect invoked, networkHandle=$networkHandle, " +
+                "reconnecting=${reconnectingJob?.isActive == true}, state=$connectionState, reason=$reason"
+        }
         if (reconnectingJob?.isActive == true) {
-            LKLog.d { "Reconnection is already in progress" }
+            LKLog.d { "[reconnect][net] reconnect skipped: reconnection is already in progress, reason=$reason" }
             return
         }
         if (this.isClosed) {
-            LKLog.d { "Skip reconnection - engine is closed" }
+            LKLog.d { "[reconnect][net] reconnect skipped: engine is closed, reason=$reason" }
             return
         }
         var url = sessionUrl
         val token = sessionToken
         if (url == null || token == null) {
-            LKLog.w { "couldn't reconnect, no url or no token" }
+            LKLog.w { "[reconnect][net] reconnect skipped: no url or no token, reason=$reason" }
             return
         }
+        pendingNetworkHandle = networkHandle
         val job = coroutineScope.launch {
             var hasResumedOnce = false
             var hasReconnectedOnce = false
+            val reconnectReason = reason
 
             val reconnectStartTime = SystemClock.elapsedRealtime()
+            val reconnectPolicy = this@RTCEngine.reconnectPolicy
+
             for (retries in 0 until MAX_RECONNECT_RETRIES) {
                 // First try use previously valid url.
                 if (retries != 0) {
                     try {
                         url = regionUrlProvider?.getNextBestRegionUrl() ?: url
                     } catch (e: Exception) {
-                        LKLog.d(e) { "[${retries + 1}] Exception while getting next best region url while reconnecting." }
+                        LKLog.d(e) { "[reconnect][net][${retries + 1}] exception while getting next best region url while reconnecting" }
                     }
                 }
 
@@ -570,21 +645,26 @@ internal constructor(
                 }
 
                 if (isClosed) {
-                    LKLog.i { "[${retries + 1}] RTCEngine closed (section 1), aborting reconnection" }
+                    LKLog.i { "[reconnect][net][${retries + 1}] RTCEngine closed (section 1), aborting reconnection" }
                     break
                 }
 
-                var startDelay = 100 + retries.toLong() * retries * 500
-                if (startDelay > 5000) {
-                    startDelay = 5000
+                val reconnectContext = ReconnectContext(
+                    retryCount = retries,
+                    elapsedTime = (SystemClock.elapsedRealtime() - reconnectStartTime).milliseconds,
+                )
+                var startDelay = reconnectPolicy.getNextRetryDelay(reconnectContext)
+                if (startDelay == null) {
+                    LKLog.i { "[reconnect][net][${retries + 1}] cancelling reconnection due to policy, reason=$reconnectReason" }
+                    break
                 }
                 if (fullReconnectOnNext) {
-                    LKLog.i { "[${retries + 1}] full reconnect requested, skipping reconnect delay." }
-                    startDelay = 0
+                    LKLog.i { "[reconnect][net][${retries + 1}] full reconnect requested, skipping reconnect delay, reason=$reconnectReason" }
+                    startDelay = 0.milliseconds
                 }
 
-                LKLog.i { "[${retries + 1}] Reconnecting to signal, attempt ${retries + 1}, delay ${startDelay}ms" }
-                if (startDelay > 0) {
+                LKLog.i { "[reconnect][signal][${retries + 1}] reconnecting to signal, delay=$startDelay, reason=$reconnectReason" }
+                if (startDelay > 0.milliseconds) {
                     delay(startDelay)
                 }
 
@@ -601,8 +681,27 @@ internal constructor(
 
                 var lastMessageSeq: Int? = null
                 val connectOptions = connectOptions ?: ConnectOptions()
+                suspend fun performSignalReconnect() {
+                    LKLog.i { "[reconnect][signal][${retries + 1}] signal connect in." }
+                    val response = client.reconnect(url!!, token, participantSid)
+                    LKLog.i { "[reconnect][signal][${retries + 1}] signal connect out." }
+                    if (response is Either.Left) {
+                        val reconnectResponse = response.value
+                        val rtcConfig = makeRTCConfig(Either.Right(reconnectResponse), connectOptions)
+                        subscriber?.updateRTCConfig(rtcConfig)
+                        publisher?.updateRTCConfig(rtcConfig)
+                        lastMessageSeq = reconnectResponse.lastMessageSeq
+                    }
+                    client.onReadyForResponses()
+                    LKLog.i { "[reconnect][signal][${retries + 1}] signal reconnect succeeded, starting ICE restart" }
+                    listener?.onSignalConnected(true)
+
+                    if (hasPublished) {
+                        negotiatePublisher()
+                    }
+                }
                 if (isFullReconnect) {
-                    LKLog.i { "[${retries + 1}] Attempting full reconnect." }
+                    LKLog.i { "[reconnect][signal][${retries + 1}] attempting full reconnect" }
 
                     if (!hasReconnectedOnce) {
                         hasReconnectedOnce = true
@@ -614,7 +713,7 @@ internal constructor(
                         listener?.onFullReconnecting()
                         joinImpl(url!!, token, connectOptions, lastRoomOptions ?: RoomOptions())
                     } catch (e: Exception) {
-                        LKLog.w(e) { "[${retries + 1}] Error during reconnection." }
+                        LKLog.w(e) { "[reconnect][signal][${retries + 1}] error during full reconnection" }
                         // reconnect failed, retry.
                         continue
                     }
@@ -624,45 +723,69 @@ internal constructor(
                         listener?.onEngineResuming()
                     }
                     connectionState = ConnectionState.RESUMING
-                    LKLog.i { "[${retries + 1}] Attempting soft reconnect." }
-                    subscriber?.prepareForIceRestart()
-                    try {
-                        LKLog.i { "[${retries + 1}] signal connect in." }
-                        val response = client.reconnect(url!!, token, participantSid)
-                        LKLog.i { "[${retries + 1}] signal connect out." }
-                        if (response is Either.Left) {
-                            val reconnectResponse = response.value
-                            val rtcConfig = makeRTCConfig(Either.Right(reconnectResponse), connectOptions)
-                            subscriber?.updateRTCConfig(rtcConfig)
-                            publisher?.updateRTCConfig(rtcConfig)
-                            lastMessageSeq = reconnectResponse.lastMessageSeq
-                        }
-                        client.onReadyForResponses()
-                    } catch (e: Exception) {
-                        LKLog.w(e) { "[${retries + 1}] Error during reconnection. ${e.message}" }
-                        // ws reconnect failed, retry.
-                        continue
+                    val attemptNetworkHandle = if (retries == 0) pendingNetworkHandle else 0L
+                    if (retries == 0) {
+                        pendingNetworkHandle = 0
                     }
-
-                    LKLog.i { "[${retries + 1}] ws reconnected, restarting ICE" }
-                    listener?.onSignalConnected(true)
-
-                    // trigger publisher reconnect
-                    // only restart publisher if it's needed
-                    if (hasPublished) {
-                        negotiatePublisher()
+                    LKLog.i {
+                        "[reconnect][net][${retries + 1}] Attempting soft reconnect, " +
+                            "networkHandle=$attemptNetworkHandle, useQuic=${connectOptions.useQuicSignal}, " +
+                            "clientConnected=${client.isConnected}"
+                    }
+                    subscriber?.prepareForIceRestart()
+                    val shouldTryQuicRestart =
+                        attemptNetworkHandle != 0L &&
+                            connectOptions.useQuicSignal &&
+                            client.isConnected
+                    if (shouldTryQuicRestart) {
+                        LKLog.i {
+                            "[reconnect][quic][${retries + 1}] soft reconnect fast path: trying QUIC restart, " +
+                                "networkHandle=$attemptNetworkHandle"
+                        }
+                        val restartOk = tryQuicRestart(attemptNetworkHandle)
+                        if (restartOk) {
+                            LKLog.i { "[reconnect][quic][${retries + 1}] QUIC restart succeeded, starting ICE restart" }
+                            listener?.onSignalConnected(true)
+                            if (hasPublished) {
+                                negotiatePublisherIceRestart()
+                            }
+                        } else {
+                            LKLog.i { "[reconnect][quic][${retries + 1}] QUIC restart failed, falling back to signal reconnect" }
+                            try {
+                                performSignalReconnect()
+                            } catch (e: Exception) {
+                                LKLog.w(e) { "[reconnect][signal][${retries + 1}] error during fallback signal reconnect: ${e.message}" }
+                                continue
+                            }
+                        }
+                    } else {
+                        LKLog.i {
+                            "[reconnect][signal][${retries + 1}] direct signal reconnect path, " +
+                                "networkHandle=$attemptNetworkHandle, useQuic=${connectOptions.useQuicSignal}, " +
+                                "clientConnected=${client.isConnected}"
+                        }
+                        try {
+                            performSignalReconnect()
+                        } catch (e: Exception) {
+                            LKLog.w(e) { "[reconnect][signal][${retries + 1}] error during signal reconnect: ${e.message}" }
+                            continue
+                        }
                     }
                 }
 
                 ensureActive()
                 if (isClosed) {
-                    LKLog.i { "[${retries + 1}] RTCEngine closed (section 2), aborting reconnection" }
+                    LKLog.i { "[reconnect][net][${retries + 1}] RTCEngine closed (section 2), aborting reconnection" }
                     break
                 }
 
                 var interruptedForFullReconnect = false
                 var waitJobs = emptyList<Job>()
                 val waitCompleted: Boolean = withTimeoutOrNull(MAX_ICE_CONNECT_TIMEOUT_MS.toLong()) {
+                    LKLog.i {
+                        "[reconnect][ice][${retries + 1}] waiting for ICE reconnect, expectReconnect=${!isFullReconnect}, " +
+                            "hasPublished=$hasPublished"
+                    }
                     // wait until publisher ICE connected
                     var publisherWaitJob: Job? = null
                     if (hasPublished) {
@@ -672,7 +795,7 @@ internal constructor(
                                 waitPublisherObserver.waitUntilConnected()
                             }
                         } else {
-                            LKLog.w { "[${retries + 1}] publisher observer missing while waiting reconnect." }
+                            LKLog.w { "[reconnect][ice][${retries + 1}] publisher observer missing while waiting reconnect" }
                         }
                     }
 
@@ -683,7 +806,7 @@ internal constructor(
                             waitSubscriberObserver.waitUntilConnected()
                         }
                     } else {
-                        LKLog.w { "[${retries + 1}] subscriber observer missing while waiting reconnect." }
+                        LKLog.w { "[reconnect][ice][${retries + 1}] subscriber observer missing while waiting reconnect" }
                         null
                     }
 
@@ -701,41 +824,42 @@ internal constructor(
                     true
                 } ?: false
 
+                LKLog.i { "[reconnect][ice][${retries + 1}] ICE wait finished, waitCompleted=$waitCompleted" }
                 if (!waitCompleted) {
                     waitJobs.forEach { it.cancel() }
                 }
                 if (interruptedForFullReconnect) {
-                    LKLog.i { "[${retries + 1}] full reconnect requested while waiting ICE; aborting current wait." }
+                    LKLog.i { "[reconnect][ice][${retries + 1}] full reconnect requested while waiting ICE; aborting current wait" }
                     continue
                 }
 
                 ensureActive()
                 if (isClosed) {
-                    LKLog.i { "[${retries + 1}] RTCEngine closed (section 3), aborting reconnection" }
+                    LKLog.i { "[reconnect][net][${retries + 1}] RTCEngine closed (section 3), aborting reconnection" }
                     break
                 }
 
-                val publisherConnected = publisher?.isConnected() == true
                 val subscriberConnected = subscriber?.isConnected() == true
-                val reconnected = subscriberConnected && (!hasPublished || publisherConnected)
+                val publisherConnected = !hasPublished || publisher?.isConnected() == true
+                val reconnected = (connectionState == ConnectionState.CONNECTED || connectionState == ConnectionState.RESUMING) && subscriberConnected && publisherConnected
                 LKLog.i {
-                    "[${retries + 1}] reconnect-check subscriberConnected=$subscriberConnected, " +
+                    "[reconnect][ice][${retries + 1}] reconnect-check subscriberConnected=$subscriberConnected, " +
                         "publisherConnected=$publisherConnected, hasPublished=$hasPublished, reconnected=$reconnected"
                 }
 
                 if (reconnected) {
-                    if (connectionState != ConnectionState.CONNECTED) {
-                        LKLog.i { "[${retries + 1}] connectionState change $connectionState => CONNECTED" }
+                    if (connectionState == ConnectionState.RESUMING) {
+                        LKLog.i { "[reconnect][ice][${retries + 1}] connectionState change $connectionState => CONNECTED" }
                         // ICE restart may keep PC state as CONNECTED and never emit a fresh callback.
                         connectionState = ConnectionState.CONNECTED
                     }
-                    if (lastMessageSeq != null) {
-                        val resendResult = resendReliableMessagesForResume(lastMessageSeq)
+                    val finalLastMessageSeq = lastMessageSeq
+                    if (finalLastMessageSeq != null) {
+                        val resendResult = resendReliableMessagesForResume(finalLastMessageSeq)
                         if (resendResult.isFailure) {
                             LKLog.w(resendResult.exceptionOrNull()) {
-                                "[${retries + 1}] Failed to resend reliable messages after resume. Retrying reconnect."
+                                "[reconnect][signal][${retries + 1}] failed to resend reliable messages after resume; retrying reconnect"
                             }
-                            continue
                         }
                     }
                     // Is connected, notify and return.
@@ -782,7 +906,11 @@ internal constructor(
 
     @CheckResult
     internal suspend fun sendData(dataPacket: LivekitModels.DataPacket): Result<Unit> {
-        ensurePublisherConnected(dataPacket.kind)
+        try {
+            ensurePublisherConnected(dataPacket.kind)
+        } catch (e: Exception) {
+            return Result.failure(e)
+        }
 
         fun sendDataImpl(dataPacket: LivekitModels.DataPacket): Result<Unit> {
             try {
@@ -873,17 +1001,7 @@ internal constructor(
         } catch (e: Exception) {
             return
         }
-        val manager = when (kind) {
-            LivekitModels.DataPacket.Kind.RELIABLE -> reliableDataChannelManager
-            LivekitModels.DataPacket.Kind.LOSSY -> lossyDataChannelManager
-            LivekitModels.DataPacket.Kind.UNRECOGNIZED -> {
-                throw IllegalArgumentException()
-            }
-        }
-
-        if (manager == null) {
-            return
-        }
+        val manager = dataChannelManagerForKind(kind) ?: return
         manager.waitForBufferedAmountLow(DATA_CHANNEL_LOW_THRESHOLD.toLong())
     }
 
@@ -894,7 +1012,7 @@ internal constructor(
         }
 
         if (publisher == null) {
-            throw RoomException.ConnectException("Publisher isn't setup yet! Is room not connected?!")
+            throw RoomException.ConnectException("Publisher isn't setup yet! Is the room connected?")
         }
 
         if (publisher?.isConnected() != true &&
@@ -904,25 +1022,37 @@ internal constructor(
             this.negotiatePublisher()
         }
 
-        val targetChannel = dataChannelForKind(kind) ?: throw RoomException.ConnectException("Publisher isn't setup yet! Is room not connected?!")
-        if (targetChannel.state() == DataChannel.State.OPEN) {
+        // Ensure data channel exists
+        dataChannelForKind(kind) ?: throw RoomException.ConnectException("Publisher data channel not established for ${kind.name}; is the room connected?")
+
+        val channelManager = dataChannelManagerForKind(kind)
+            ?: throw RoomException.ConnectException("Publisher data channel manager not established for ${kind.name}; is the room connected?")
+        if (channelManager.state == DataChannel.State.OPEN) {
             return
         }
 
         // wait until publisher ICE connected
         val endTime = SystemClock.elapsedRealtime() + MAX_ICE_CONNECT_TIMEOUT_MS
         while (SystemClock.elapsedRealtime() < endTime) {
-            if (fullReconnectOnNext) {
-                throw RoomException.ConnectException("publisher reconnect superseded by full reconnect")
-            }
-            if (publisher?.isConnected() == true && targetChannel.state() == DataChannel.State.OPEN) {
+            if (publisher?.isConnected() == true &&
+                channelManager.state == DataChannel.State.OPEN
+            ) {
                 return
             }
             delay(50)
         }
 
-        throw RoomException.ConnectException("could not establish publisher connection")
+        throw RoomException.ConnectException(
+            "could not establish publisher connection: publisher state: ${publisherObserver?.connectionState}, channel state: ${channelManager.state}",
+        )
     }
+
+    private fun dataChannelManagerForKind(kind: LivekitModels.DataPacket.Kind): DataChannelManager? =
+        when (kind) {
+            LivekitModels.DataPacket.Kind.RELIABLE -> reliableDataChannelManager
+            LivekitModels.DataPacket.Kind.LOSSY -> lossyDataChannelManager
+            LivekitModels.DataPacket.Kind.UNRECOGNIZED -> throw IllegalArgumentException("Unknown data packet kind!")
+        }
 
     private fun dataChannelForKind(kind: LivekitModels.DataPacket.Kind) =
         when (kind) {
@@ -1039,6 +1169,7 @@ internal constructor(
         fun onEngineReconnecting()
         fun onEngineResuming() {}
         fun onEngineResumed() {}
+        fun onEngineConnectionLost(reason: String = "unspecified") {}
         fun onEngineDisconnected(reason: DisconnectReason)
         fun onFailToConnect(error: Throwable)
         fun onJoinResponse(response: JoinResponse)
@@ -1077,7 +1208,7 @@ internal constructor(
         @VisibleForTesting
         const val LOSSY_DATA_CHANNEL_LABEL = "_lossy"
         internal const val MAX_DATA_PACKET_SIZE = 15 * 1024 // 15 KB
-        private const val MAX_RECONNECT_RETRIES = 14 // ~60s
+        private const val MAX_RECONNECT_RETRIES = 30
         private const val MAX_RECONNECT_TIMEOUT = 60 * 1000
         private const val MAX_ICE_CONNECT_TIMEOUT_MS = 20000
 
@@ -1213,7 +1344,7 @@ internal constructor(
     override fun onClose(reason: String, code: Int) {
         LKLog.i { "received close event: $reason, code: $code" }
         abortPendingPublishTracks()
-        reconnect()
+        listener?.onEngineConnectionLost("signal closed: (code=$code reason=$reason)")
     }
 
     override fun onRemoteMuteChanged(trackSid: String, muted: Boolean) {
@@ -1243,7 +1374,7 @@ internal constructor(
                 fullReconnectOnNext = false
                 coroutineScope.launch {
                     yield()
-                    reconnect()
+                    reconnect(reason = "server leave action=${leave.action.name} reason=${leave.reason.name}")
                 }
             }
 
@@ -1254,7 +1385,7 @@ internal constructor(
                 fullReconnectOnNext = true
                 coroutineScope.launch {
                     yield()
-                    reconnect()
+                    reconnect(reason = "server leave action=${leave.action.name} reason=${leave.reason.name}")
                 }
             }
 

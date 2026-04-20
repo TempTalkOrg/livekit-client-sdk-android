@@ -18,31 +18,18 @@
             android:src="@drawable/banner_dark" />
 
         <com.google.android.material.textfield.TextInputLayout
-            android:id="@+id/url_dropdown_layout"
+            android:id="@+id/preset_dropdown_layout"
             style="@style/Widget.MaterialComponents.TextInputLayout.FilledBox.ExposedDropdownMenu"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="20dp"
-            android:hint="@string/url">
+            android:hint="@string/connection_preset">
 
             <AutoCompleteTextView
-                android:id="@+id/url_dropdown"
+                android:id="@+id/preset_dropdown"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:inputType="none" />
-
-        </com.google.android.material.textfield.TextInputLayout>
-
-        <com.google.android.material.textfield.TextInputLayout
-            android:id="@+id/token"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="20dp"
-            android:hint="@string/token">
-
-            <com.google.android.material.textfield.TextInputEditText
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content" />
 
         </com.google.android.material.textfield.TextInputLayout>
 

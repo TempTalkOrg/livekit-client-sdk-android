@@ -22,7 +22,7 @@ public class Connection {
 
     private native void closeStream(long handle, int streamId);
 
-    private native void restart(long handle);
+    private native void restart(long handle, long networkHandle);
 
     private native void close(long handle);
 
@@ -40,6 +40,10 @@ public class Connection {
         public void onStreamCreated(Connection conn, int streamId);
 
         public void onStreamClosed(Connection conn, int streamId);
+
+        public void onStreamDataAcked(Connection conn, int streamId, long ackDelayTime, int ackedBytes, int inflightBytes);
+
+        public void onStreamDataSent(Connection conn, int streamId, int transId, int size);
 
         public void onRecvCmd(Connection conn, long timestamp, int transId, int streamId, byte[] data);
 
@@ -78,6 +82,25 @@ public class Connection {
                 Stream stream = streams.remove(streamId);
                 if (stream != null) {
                     handler.onStreamClosed(conn, stream);
+                }
+            }
+
+
+            @Override
+            public void onStreamDataAcked(Connection conn, int streamId, long ackDelayTime, int ackedBytes, int inflightBytes) {
+                // 流包确认时的处理逻辑
+                Stream stream = streams.get(streamId);
+                if (stream != null) {
+                    handler.onStreamDataAcked(conn, stream, ackDelayTime, ackedBytes, inflightBytes);
+                }
+            }
+
+            @Override
+            public void onStreamDataSent(Connection conn, int streamId, int transId, int size) {
+                // 流数据发送时的处理逻辑
+                Stream stream = streams.get(streamId);
+                if (stream != null) {
+                    handler.onStreamDataSent(conn, stream, transId, size);
                 }
             }
 
@@ -183,11 +206,15 @@ public class Connection {
         return userObject;
     }
 
-    public void restart() {
+    public void restart(long networkHandle) {
         if (isClosed()) {
             return;
         }
-        restart(this.connectionHandle);
+        restart(this.connectionHandle, networkHandle);
+    }
+
+    public void restart(){
+        restart(0);
     }
 
     public void close() {

@@ -35,31 +35,34 @@ class MainActivity : AppCompatActivity() {
 
         val binding = MainActivityBinding.inflate(layoutInflater)
 
-        // Set up the URL dropdown
-        val urls = arrayOf(
-            MainViewModel.URL,
-            // "https://192.168.1.3:7880/"
-        )
-        val adapter = ArrayAdapter(this, android.R.layout.simple_dropdown_item_1line, urls)
-        binding.urlDropdown.setAdapter(adapter)
+        val presets = viewModel.presets
+        val presetLabels = presets.map { it.label }.toTypedArray()
+        val presetAdapter = ArrayAdapter(this, android.R.layout.simple_dropdown_item_1line, presetLabels)
+        binding.presetDropdown.setAdapter(presetAdapter)
 
-        val urlString = viewModel.getSavedUrl()
-        val tokenString = viewModel.getSavedToken()
+        val selectedPreset = viewModel.getSelectedPreset()
+        binding.presetDropdown.setText(selectedPreset.label, false)
+
         val e2EEOn = viewModel.getE2EEOptionsOn()
         val e2EEKey = viewModel.getSavedE2EEKey()
-        val quicOn = viewModel.getQuicSignalOn()
         val savedQuicDeviceType = viewModel.getQuicDeviceType()
         val savedQuicCidTag = viewModel.getQuicCidTag()
 
         binding.run {
-            urlDropdown.setText(urlString, false)
-            token.editText?.text = SpannableStringBuilder(tokenString)
             e2eeEnabled.isChecked = e2EEOn
             e2eeKey.editText?.text = SpannableStringBuilder(e2EEKey)
-            quicEnabled.isChecked = quicOn
+            quicEnabled.isChecked = selectedPreset.useQuicSignal
             quicDeviceType.editText?.text = SpannableStringBuilder(savedQuicDeviceType.toString())
             quicCidTag.editText?.text = SpannableStringBuilder(savedQuicCidTag)
+
+            presetDropdown.setOnItemClickListener { _, _, position, _ ->
+                val preset = presets[position]
+                quicEnabled.isChecked = preset.useQuicSignal
+            }
+
             connectButton.setOnClickListener {
+                val selectedLabel = presetDropdown.text.toString()
+                val preset = presets.find { it.label == selectedLabel } ?: presets.first()
                 val quicDeviceTypeInt =
                     quicDeviceType.editText?.text?.toString()?.toIntOrNull()
                         ?: MainViewModel.DEFAULT_QUIC_DEVICE_TYPE
@@ -68,13 +71,15 @@ class MainActivity : AppCompatActivity() {
                     putExtra(
                         CallActivity.KEY_ARGS,
                         CallActivity.BundleArgs(
-                            url = urlDropdown.text.toString(),
-                            token = token.editText?.text.toString(),
+                            url = preset.url,
+                            token = preset.token,
                             e2eeOn = e2eeEnabled.isChecked,
                             e2eeKey = e2eeKey.editText?.text.toString(),
                             quicOn = quicEnabled.isChecked,
                             quicDeviceType = quicDeviceTypeInt,
                             quicCidTag = quicCidTagStr,
+                            serverHost = preset.serverHost,
+                            caCertPem = preset.caCertPem,
                             stressTest = StressTest.None,
                         ),
                     )
@@ -84,11 +89,13 @@ class MainActivity : AppCompatActivity() {
             }
 
             saveButton.setOnClickListener {
-                viewModel.setSavedUrl(urlDropdown.text?.toString() ?: "")
-                viewModel.setSavedToken(token.editText?.text?.toString() ?: "")
+                val selectedLabel = presetDropdown.text.toString()
+                val preset = presets.find { it.label == selectedLabel }
+                if (preset != null) {
+                    viewModel.setSavedPresetId(preset.id)
+                }
                 viewModel.setSavedE2EEOn(e2eeEnabled.isChecked)
                 viewModel.setSavedE2EEKey(e2eeKey.editText?.text?.toString() ?: "")
-                viewModel.setQuicSignalOn(quicEnabled.isChecked)
                 viewModel.setQuicDeviceType(
                     quicDeviceType.editText?.text?.toString()?.toIntOrNull()
                         ?: MainViewModel.DEFAULT_QUIC_DEVICE_TYPE,
@@ -104,11 +111,11 @@ class MainActivity : AppCompatActivity() {
 
             resetButton.setOnClickListener {
                 viewModel.reset()
-                urlDropdown.setText(MainViewModel.URL, false)
-                token.editText?.text = SpannableStringBuilder(MainViewModel.TOKEN)
+                val defaultPreset = presets.first()
+                presetDropdown.setText(defaultPreset.label, false)
+                quicEnabled.isChecked = defaultPreset.useQuicSignal
                 e2eeEnabled.isChecked = false
                 e2eeKey.editText?.text = SpannableStringBuilder("")
-                quicEnabled.isChecked = false
                 quicDeviceType.editText?.text =
                     SpannableStringBuilder(MainViewModel.DEFAULT_QUIC_DEVICE_TYPE.toString())
                 quicCidTag.editText?.text = SpannableStringBuilder(MainViewModel.DEFAULT_QUIC_CID_TAG)

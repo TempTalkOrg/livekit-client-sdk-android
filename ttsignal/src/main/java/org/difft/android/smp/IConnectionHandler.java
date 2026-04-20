@@ -12,6 +12,10 @@ public interface IConnectionHandler {
 
     public void onStreamClosed(Connection conn, Stream stream);
 
+	public default void onStreamDataAcked(Connection conn, Stream stream, long ackDelayTime, int ackedBytes, int inFlightBytes) {}
+
+	public default void onStreamDataSent(Connection conn, Stream stream, int transId, int size) {}
+
     public void onRecvCmd(Connection conn, long timestamp, int transId, Stream stream, byte[] data);
 
     public void onRecvData(Connection conn, long timestamp, int transId, Stream stream, byte[] data);

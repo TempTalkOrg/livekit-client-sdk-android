@@ -44,6 +44,10 @@ public class Config {
     public int logLevel = 0;
     // number of senders
     public int numOfSenders = 1;
+    // Logical hostname for TLS SNI and certificate hostname verification (IP direct scenario)
+    public String serverHost = "";
+    // Self-signed root CA certificate in PEM format for custom certificate chain verification
+    public String caCertPem = "";
 
     public Config() {
         // Default constructor

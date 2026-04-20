@@ -60,6 +60,7 @@ import okhttp3.Request
 import okhttp3.Response
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
+import java.net.UnknownHostException
 import java.util.Date
 import javax.inject.Inject
 import javax.inject.Named
@@ -100,10 +101,25 @@ constructor(
 
     // Correlate callbacks with the active connection attempt to avoid races
     private var currentAttemptId: Long = 0
+
+    @Volatile
+    private var activeAttemptId: Long = 0
+
     private var connectStartTime: Long = 0
     private fun isActiveTransport(transport: SignalTransport): Boolean {
-        // Each transport is tied to a specific attemptId, so no need to manage a map.
-        return transport == this.transport && transport.attemptId == this.transport?.attemptId
+        val currentTransport = this.transport
+        return transport == currentTransport && transport.attemptId == activeAttemptId
+    }
+
+    private fun invalidateAttempt(attemptId: Long) {
+        if (activeAttemptId == attemptId) {
+            activeAttemptId = 0
+        }
+
+        val currentTransport = transport
+        if (currentTransport?.attemptId == attemptId) {
+            transport = null
+        }
     }
 
     // join will always return a JoinResponse.
@@ -115,6 +131,10 @@ constructor(
             Either<ReconnectResponse, Unit>,
             >,
         >? = null
+
+    @Volatile
+    private var joinContinuationAttemptId: Long = 0
+    private val joinContinuationLock = Any()
     private lateinit var coroutineScope: CloseableCoroutineScope
 
     /**
@@ -197,6 +217,7 @@ constructor(
         // Increment attempt id to mark this connection try
         currentAttemptId += 1
         val attemptId = currentAttemptId
+        activeAttemptId = attemptId
 
         val sendOnOpen = if (options.ttCallRequest != null && token.isEmpty()) {
             options.ttCallRequest.let { req ->
@@ -209,12 +230,12 @@ constructor(
         connectStartTime = System.currentTimeMillis()
 
         try {
-            LKLog.i { "[track-reconnect] connect - in, attempt=$attemptId" }
+            LKLog.i { "[reconnect][signal] connect - in, attempt=$attemptId" }
             val ret = connectWithTimeout(15 * 1000, wsUrlString, token, options, attemptId, sendOnOpen)
-            LKLog.i { "[track-reconnect] connect - out, attempt=$attemptId" }
+            LKLog.i { "[reconnect][signal] connect - out, attempt=$attemptId" }
             return ret
         } catch (t: Throwable) {
-            LKLog.i { "[track-reconnect] connect - out with exception, attempt=$attemptId" }
+            LKLog.i { "[reconnect][signal] connect - out with exception, attempt=$attemptId" }
             throw t
         }
     }
@@ -231,37 +252,69 @@ constructor(
             withTimeout(timeMillis) {
                 suspendCancellableCoroutine { it ->
                     // Wait for join/reconnect response via WebSocketListener
-                    joinContinuation = it
+                    synchronized(joinContinuationLock) {
+                        joinContinuation = it
+                        joinContinuationAttemptId = attemptId
+                    }
 
-                    LKLog.i { "[track-reconnect] new transport created - beg, attempt=$attemptId" }
+                    LKLog.i { "[reconnect][signal] new transport created - beg, attempt=$attemptId" }
                     val newTransport = transportFactory.create(options, attemptId, sendOnOpen)
 
                     it.invokeOnCancellation {
-                        LKLog.i { "[track-reconnect] the coroutine is cancelled or times out" }
-                        newTransport?.cancel()
-                        joinContinuation = null
+                        LKLog.i { "[reconnect][signal] the coroutine is cancelled or times out" }
+                        invalidateAttempt(attemptId)
+                        newTransport.cancel()
+                        clearJoinContinuation(attemptId)
                     }
 
                     newTransport.connect(url, token, options, this@SignalClient)
                     transport = newTransport
-                    LKLog.i { "[track-reconnect] new transport created - end, attempt=$attemptId, transport=$newTransport" }
+                    LKLog.i { "[reconnect][signal] new transport created - end, attempt=$attemptId, transport=$newTransport" }
                 }
             }
         } catch (t: TimeoutCancellationException) {
             // Timeout: close and propagate
             val localTransport = transport
-            if (localTransport != null && isActiveTransport(localTransport)) {
-                LKLog.i { "[track-reconnect] connect - out timeout exception, attempt=$attemptId, close transport=$localTransport" }
+            if (localTransport != null && localTransport.attemptId == attemptId && isActiveTransport(localTransport)) {
+                LKLog.i { "[reconnect][signal] connect - out timeout exception, attempt=$attemptId, close transport=$localTransport" }
                 // Immediately close
+                invalidateAttempt(attemptId)
                 localTransport.cancel()
+            } else {
+                invalidateAttempt(attemptId)
             }
-            throw t
+            // Wrap kotlinx coroutine internal exception into a RoomException so callers
+            // can handle it as a regular SDK exception without depending on coroutine internals,
+            // and so it does not propagate as a CancellationException to the calling scope.
+            throw RoomException.ConnectTimeoutException(
+                message = "Timed out connecting to signal server after $timeMillis ms",
+                cause = t,
+                timeoutMs = timeMillis,
+            )
+        }
+    }
+
+    private fun clearJoinContinuation(attemptId: Long? = null): CancellableContinuation<
+        Either<
+            JoinResponse,
+            Either<ReconnectResponse, Unit>,
+            >,
+        >? {
+        synchronized(joinContinuationLock) {
+            if (attemptId != null && joinContinuationAttemptId != attemptId) {
+                return null
+            }
+
+            val cont = joinContinuation
+            joinContinuation = null
+            joinContinuationAttemptId = 0
+            return cont
         }
     }
 
     @OptIn(InternalCoroutinesApi::class)
-    private fun failJoinContinuation(error: Throwable? = null) {
-        val cont = joinContinuation
+    private fun failJoinContinuation(attemptId: Long? = null, error: Throwable? = null) {
+        val cont = clearJoinContinuation(attemptId)
         if (cont != null) {
             if (error != null) {
                 cont.tryResumeWithException(error)?.let { token ->
@@ -271,7 +324,13 @@ constructor(
                 cont.cancel()
             }
         }
-        joinContinuation = null
+    }
+
+    private fun resumeJoinContinuation(
+        attemptId: Long,
+        value: Either<JoinResponse, Either<ReconnectResponse, Unit>>,
+    ) {
+        clearJoinContinuation(attemptId)?.resumeWith(Result.success(value))
     }
 
     private fun createConnectionParams(
@@ -368,9 +427,9 @@ constructor(
 
     // ---------------------------------SignalTransport  Listener --------------------------------------//
     override fun onOpen(transport: SignalTransport) {
-        LKLog.i { "[track-reconnect] [quic] transport onOpen(${System.currentTimeMillis() - connectStartTime}) send=${transport.sendOnOpen != null}, transport=$transport" }
+        LKLog.i { "[reconnect][signal] transport onOpen(${System.currentTimeMillis() - connectStartTime}) send=${transport.sendOnOpen != null}, transport=$transport" }
         if (!isActiveTransport(transport)) {
-            LKLog.i { "[track-reconnect] transport onOpen ignored (stale) [aliveAttempt=$currentAttemptId] ts=$transport" }
+            LKLog.i { "[reconnect][signal] transport onOpen ignored (stale) [aliveAttempt=$currentAttemptId] ts=$transport" }
             return
         }
 
@@ -399,28 +458,28 @@ constructor(
 
     override fun onClosed(transport: SignalTransport, code: Int, reason: String) {
         val stale = !isActiveTransport(transport)
-        LKLog.i { "[track-reconnect] transport onClosed \"${if (stale) "ignored (stale) " else ""}\" code=$code, transport=$transport, reason=$reason" }
+        LKLog.i { "[reconnect][signal] transport onClosed \"${if (stale) "ignored (stale) " else ""}\" code=$code, transport=$transport, reason=$reason" }
 
         if (stale) {
             return
         }
-        handleWebSocketClose(reason, code)
+        handleWebSocketClose(transport, reason, code)
     }
 
     override fun onClosing(transport: SignalTransport, code: Int, reason: String) {
-        LKLog.i { "[track-reconnect] transport closing, transport=$transport" }
+        LKLog.i { "[reconnect][signal] transport closing, transport=$transport" }
     }
 
     override fun onFailure(transport: SignalTransport, t: Throwable, response: Response?) {
         val stale = !isActiveTransport(transport)
-        LKLog.i(t) { "[track-reconnect] transport failure \"${if (stale) "ignored (stale) " else ""}\" currentTs=${this.transport}, transport=$transport, response=$response" }
+        LKLog.i(t) { "[reconnect][signal] transport failure \"${if (stale) "ignored (stale) " else ""}\" currentTs=${this.transport}, transport=$transport, response=$response" }
 
         if (stale) {
             return
         }
         var exceptionError: Exception? = lastConnectionException.also { lastConnectionException = null }
         try {
-            if (exceptionError == null) {
+            if (exceptionError == null && !t.hasUnknownHostCause()) {
                 lastUrl?.let {
                     val validationUrl = it.toHttpUrl().replaceFirst("/rtc?", "/rtc/validate?")
                     val request = Request.Builder()
@@ -431,35 +490,40 @@ constructor(
                             }
                         }
                         .build()
-                    val resp = okHttpClient.newCall(request).execute()
-                    val body = resp.body
-                    if (!resp.isSuccessful) {
-                        val reason = body?.string()
-                        exceptionError = if (resp.code == 401) {
-                            RoomException.NoAuthException(reason)
-                        } else {
-                            Exception(reason)
+                    okHttpClient.newCall(request).execute().use { resp ->
+                        val body = resp.body
+                        if (!resp.isSuccessful) {
+                            val reason = body?.string()
+                            exceptionError = if (resp.code == 401) {
+                                RoomException.NoAuthException(reason)
+                            } else {
+                                Exception(reason)
+                            }
                         }
                     }
-
-                    body?.close()
                 }
+            } else if (exceptionError == null) {
+                LKLog.i { "[reconnect][signal] skipping connection validation for UnknownHostException" }
             }
         } catch (e: Throwable) {
             LKLog.e { "failed to validate connection" }
+        }
+
+        if (!isActiveTransport(transport)) {
+            LKLog.i { "[reconnect][signal] transport failure ignored after validation (stale), transport=$transport" }
+            return
         }
 
         val error = exceptionError
         if (error != null) {
             LKLog.e { "transport failure(reason): $error" }
             listener?.onError(error)
-            failJoinContinuation(error)
+            failJoinContinuation(transport.attemptId, error)
         } else {
             LKLog.e { "transport failure(response): $response" }
             listener?.onError(t)
-            failJoinContinuation(t)
+            failJoinContinuation(transport.attemptId, t)
         }
-        joinContinuation = null
 
         val wasConnected = isConnected
 
@@ -467,21 +531,41 @@ constructor(
             // onClosing/onClosed will not be called after onFailure.
             // Handle websocket closure here.
             handleWebSocketClose(
+                transport = transport,
                 reason = error?.message ?: response?.toString() ?: t.localizedMessage ?: "transport failure",
                 code = response?.code ?: CLOSE_REASON_WEBSOCKET_FAILURE,
             )
         }
     }
 
-    private fun handleWebSocketClose(reason: String, code: Int) {
-        LKLog.i { "[track-reconnect] websocket closed reason=$reason, code=$code" }
+    override fun onRestarted(transport: SignalTransport, result: Int, address: String?) {
+        if (!isActiveTransport(transport)) {
+            return
+        }
+        LKLog.i { "[reconnect][quic] transport restarted, result=$result, address=$address" }
+        listener?.onTransportRestarted(result, address)
+    }
+
+    private fun Throwable.hasUnknownHostCause(): Boolean {
+        var current: Throwable? = this
+        while (current != null) {
+            if (current is UnknownHostException) {
+                return true
+            }
+            current = current.cause
+        }
+        return false
+    }
+
+    private fun handleWebSocketClose(transport: SignalTransport, reason: String, code: Int) {
+        LKLog.i { "[reconnect][signal] websocket closed reason=$reason, code=$code" }
         isConnected = false
         requestFlow.resetReplayCache()
         responseFlow.resetReplayCache()
         pingJob?.cancel()
         pongJob?.cancel()
         // If connect() is still waiting, cancel it to avoid hanging
-        failJoinContinuation(Exception("websocket closed before connected: $reason (code=$code)"))
+        failJoinContinuation(transport.attemptId, Exception("websocket closed before connected: $reason (code=$code)"))
         listener?.onClose(reason, code)
     }
 
@@ -779,9 +863,17 @@ constructor(
                     edition = ServerInfo.Edition.fromProto(response.join.serverInfo.edition),
                     version = serverVersion,
                 )
-                joinContinuation?.resumeWith(Result.success(Either.Left(response.join)))
-                joinContinuation = null
+                resumeJoinContinuation(transport.attemptId, Either.Left(response.join))
             } else if (response.hasLeave()) {
+                if (!isConnected) {
+                    failJoinContinuation(
+                        transport.attemptId,
+                        Exception(
+                            "signal reconnect interrupted by server leave: " +
+                                "${response.leave.action.name}/${response.leave.reason.name}",
+                        ),
+                    )
+                }
                 // Some reconnects may immediately send leave back without a join response first.
                 handleSignalResponseImpl(transport, response)
             } else if (isReconnecting) {
@@ -794,11 +886,9 @@ constructor(
                 startPingJob()
 
                 if (response.hasReconnect()) {
-                    joinContinuation?.resumeWith(Result.success(Either.Right(Either.Left(response.reconnect))))
-                    joinContinuation = null
+                    resumeJoinContinuation(transport.attemptId, Either.Right(Either.Left(response.reconnect)))
                 } else {
-                    joinContinuation?.resumeWith(Result.success(Either.Right(Either.Right(Unit))))
-                    joinContinuation = null
+                    resumeJoinContinuation(transport.attemptId, Either.Right(Either.Right(Unit)))
                     // Non-reconnect response, handle normally
                     shouldProcessMessage = true
                 }
@@ -975,6 +1065,14 @@ constructor(
     }
 
     /**
+     * Requests the active transport to migrate to a new network path (QUIC connection migration).
+     */
+    fun restartTransport(networkHandle: Long) {
+        LKLog.i { "[reconnect][quic] restartTransport called, networkHandle=$networkHandle, transport=$transport" }
+        transport?.restart(networkHandle)
+    }
+
+    /**
      * Closes out any existing websocket connection, and cleans up used resources.
      *
      * Can be reused afterwards.
@@ -983,6 +1081,7 @@ constructor(
         LKLog.i { "Closing SignalClient: code = $code, reason = $reason" }
         isConnected = false
         isReconnecting = false
+        activeAttemptId = 0
         if (::coroutineScope.isInitialized) {
             coroutineScope.close()
         }
@@ -1031,6 +1130,7 @@ constructor(
         fun onRefreshToken(token: String)
         fun onLocalTrackUnpublished(trackUnpublished: LivekitRtc.TrackUnpublishedResponse)
         fun onLocalTrackSubscribed(trackSubscribed: LivekitRtc.TrackSubscribed)
+        fun onTransportRestarted(result: Int, address: String?) {}
     }
 
     companion object {

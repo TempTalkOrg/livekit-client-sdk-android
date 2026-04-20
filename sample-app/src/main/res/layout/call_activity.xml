@@ -36,7 +36,115 @@
         android:id="@+id/audience_row"
         android:layout_width="match_parent"
         android:layout_height="120dp"
-        app:layout_constraintBottom_toTopOf="@id/df_config_panel" />
+        app:layout_constraintBottom_toTopOf="@id/voice_changer_panel" />
+
+    <!-- Voice Changer Panel -->
+    <LinearLayout
+        android:id="@+id/voice_changer_panel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:background="#99000000"
+        android:paddingHorizontal="12dp"
+        android:paddingVertical="8dp"
+        android:visibility="gone"
+        app:layout_constraintBottom_toTopOf="@id/df_config_panel">
+
+        <!-- Preset buttons row -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/preset_monster"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/vc_preset_monster"
+                android:textSize="9sp"
+                android:textColor="@android:color/white"
+                android:background="?android:attr/selectableItemBackground"
+                android:paddingHorizontal="0dp" />
+
+            <Button
+                android:id="@+id/preset_uncle"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/vc_preset_uncle"
+                android:textSize="9sp"
+                android:textColor="@android:color/white"
+                android:background="?android:attr/selectableItemBackground"
+                android:paddingHorizontal="0dp" />
+
+            <Button
+                android:id="@+id/preset_original"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/vc_preset_original"
+                android:textSize="9sp"
+                android:textColor="@android:color/white"
+                android:background="?android:attr/selectableItemBackground"
+                android:paddingHorizontal="0dp" />
+
+            <Button
+                android:id="@+id/preset_goddess"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/vc_preset_goddess"
+                android:textSize="9sp"
+                android:textColor="@android:color/white"
+                android:background="?android:attr/selectableItemBackground"
+                android:paddingHorizontal="0dp" />
+
+            <Button
+                android:id="@+id/preset_loli"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/vc_preset_loli"
+                android:textSize="9sp"
+                android:textColor="@android:color/white"
+                android:background="?android:attr/selectableItemBackground"
+                android:paddingHorizontal="0dp" />
+        </LinearLayout>
+
+        <!-- Custom pitch slider row -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:layout_marginTop="4dp">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/vc_pitch"
+                android:textColor="@android:color/white"
+                android:textSize="12sp" />
+
+            <TextView
+                android:id="@+id/pitch_value"
+                android:layout_width="40dp"
+                android:layout_height="wrap_content"
+                android:text="0"
+                android:textColor="@android:color/white"
+                android:textSize="12sp"
+                android:gravity="end" />
+        </LinearLayout>
+
+        <SeekBar
+            android:id="@+id/pitch_slider"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:max="24"
+            android:progress="12" />
+    </LinearLayout>
 
     <LinearLayout
         android:id="@+id/df_config_panel"
@@ -209,6 +317,17 @@
             android:text="@string/denoise_open"
             android:background="?android:attr/selectableItemBackground"
             android:textColor="@android:color/white"
+            app:tint="@android:color/white"/>
+
+        <Button
+            android:id="@+id/vc_ctl"
+            android:layout_width="@dimen/control_size"
+            android:layout_height="@dimen/control_size"
+            android:layout_weight="1"
+            android:text="@string/vc_open"
+            android:background="?android:attr/selectableItemBackground"
+            android:textColor="@android:color/white"
+            android:textSize="10sp"
             app:tint="@android:color/white"/>
 
         <Button

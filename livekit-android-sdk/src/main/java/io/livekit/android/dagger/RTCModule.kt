@@ -37,6 +37,7 @@ import io.livekit.android.e2ee.DataPacketCryptorManager
 import io.livekit.android.e2ee.DataPacketCryptorManagerImpl
 import io.livekit.android.memory.CloseableManager
 import io.livekit.android.room.transport.QuicTransport
+import io.livekit.android.room.transport.QuicWithFallbackTransport
 import io.livekit.android.room.transport.SignalTransport
 import io.livekit.android.room.transport.WebSocketTransport
 import io.livekit.android.util.LKLog
@@ -190,13 +191,13 @@ internal object RTCModule {
         config.taskThreads = 1
         config.timerThreads = 1
         config.idleTimeOut = 20000
-        config.alpn = "ttsignal"
+        config.alpn = "ttsignal,ttsignal-ip"
         config.hostname = "localhost"
         config.port = 443
         config.maxConnections = 1000
         config.congestCtrl = Const.CC_BBR2
         config.pingOn = true
-        config.numOfSenders = 2
+        config.numOfSenders = 1
         config.logLevel = LiveKit.loggingLevelQuic.toQuicLogLevel()
         config.logHandler = Config.LogHandler { level, msg ->
             val loggingLevel = fromQuicLogLevel(level)
@@ -220,7 +221,8 @@ internal object RTCModule {
     ): SignalTransport.Factory {
         return SignalTransport.Factory { options, attemptId, sendOnOpen ->
             if (options.useQuicSignal) {
-                QuicTransport(attemptId, sendOnOpen, ttsignalConnector)
+                val quic = QuicTransport(attemptId, sendOnOpen, ttsignalConnector)
+                QuicWithFallbackTransport(quic, okHttpClient)
             } else {
                 WebSocketTransport(attemptId, sendOnOpen, okHttpClient)
             }

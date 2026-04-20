@@ -33,6 +33,7 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import com.github.TempTalkOrg.audio_pipeline.AudioModule
 import com.github.TempTalkOrg.audio_pipeline.AudioPipelineProcessor
 import com.github.TempTalkOrg.audio_pipeline.DeepFilterConfig
+import com.github.TempTalkOrg.audio_pipeline.SoundTouchConfig
 import com.xwray.groupie.GroupieAdapter
 import io.livekit.android.audio.AudioProcessorOptions
 import io.livekit.android.sample.common.R
@@ -46,8 +47,10 @@ import kotlinx.coroutines.launch
 import kotlinx.parcelize.Parcelize
 
 class CallActivity : AppCompatActivity() {
-    private val denoiser: AudioPipelineProcessor = AudioPipelineProcessor(debugLog = true)
+    private val denoiser: AudioPipelineProcessor by lazy { AudioPipelineProcessor(context = applicationContext, debugLog = true) }
     private var currentDfConfig = DeepFilterConfig()
+    private var vcEnabled = false
+    private var selectedPreset: String? = null
 
     private val viewModel: CallViewModel by viewModelByFactory {
         val args = intent.getParcelableExtra<BundleArgs>(KEY_ARGS)
@@ -61,6 +64,8 @@ class CallActivity : AppCompatActivity() {
             quic = args.quicOn,
             quicDeviceType = args.quicDeviceType,
             quicCidTag = args.quicCidTag,
+            serverHost = args.serverHost,
+            caCertPem = args.caCertPem,
             stressTest = args.stressTest,
             application = application,
             audioProcessorOptions = AudioProcessorOptions(
@@ -265,6 +270,54 @@ class CallActivity : AppCompatActivity() {
 
         updateDfConfigPanel()
 
+        // Voice changer controls
+        binding.vcCtl.setOnClickListener {
+            vcEnabled = !vcEnabled
+            if (vcEnabled) {
+                binding.vcCtl.setText(io.livekit.android.sample.R.string.vc_close)
+                binding.voiceChangerPanel.visibility = android.view.View.VISIBLE
+                val preset = selectedPreset ?: "original"
+                denoiser.setSoundTouchPreset(preset)
+            } else {
+                binding.vcCtl.setText(io.livekit.android.sample.R.string.vc_open)
+                binding.voiceChangerPanel.visibility = android.view.View.GONE
+                denoiser.setSoundTouchConfig(SoundTouchConfig(enabled = false))
+            }
+        }
+
+        val presetButtons = listOf(
+            binding.presetLoli to "loli",
+            binding.presetGoddess to "goddess",
+            binding.presetOriginal to "original",
+            binding.presetUncle to "uncle",
+            binding.presetMonster to "monster",
+        )
+        for ((button, preset) in presetButtons) {
+            button.setOnClickListener {
+                selectedPreset = preset
+                denoiser.setSoundTouchPreset(preset)
+                updatePresetSelection(selectedPreset)
+                // sync slider to preset semitones
+                val semitones = SoundTouchConfig.PRESETS[preset]?.pitchSemiTones ?: 0f
+                binding.pitchSlider.progress = (semitones + 12).toInt()
+                binding.pitchValue.text = semitones.toInt().toString()
+            }
+        }
+
+        binding.pitchSlider.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) {
+                val semitones = progress - 12
+                binding.pitchValue.text = semitones.toString()
+                if (fromUser) {
+                    selectedPreset = null
+                    updatePresetSelection(null)
+                    denoiser.setSoundTouchConfig(SoundTouchConfig(enabled = true, pitchSemiTones = semitones.toFloat()))
+                }
+            }
+            override fun onStartTrackingTouch(seekBar: SeekBar) {}
+            override fun onStopTrackingTouch(seekBar: SeekBar) {}
+        })
+
         binding.audioSelect.setOnClickListener {
             showSelectAudioDeviceDialog(viewModel)
         }
@@ -298,6 +351,19 @@ class CallActivity : AppCompatActivity() {
             viewModel.dataReceived.collect {
                 Toast.makeText(this@CallActivity, "Data received: $it", Toast.LENGTH_LONG).show()
             }
+        }
+    }
+
+    private fun updatePresetSelection(active: String?) {
+        val presetButtons = listOf(
+            binding.presetLoli to "loli",
+            binding.presetGoddess to "goddess",
+            binding.presetOriginal to "original",
+            binding.presetUncle to "uncle",
+            binding.presetMonster to "monster",
+        )
+        for ((button, preset) in presetButtons) {
+            button.alpha = if (preset == active) 1.0f else 0.45f
         }
     }
 
@@ -337,6 +403,8 @@ class CallActivity : AppCompatActivity() {
         val quicOn: Boolean,
         val quicDeviceType: Int,
         val quicCidTag: String,
+        val serverHost: String = "",
+        val caCertPem: String = "",
         val stressTest: StressTest,
     ) : Parcelable
 }

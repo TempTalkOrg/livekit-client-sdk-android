@@ -8,6 +8,7 @@
 .externalNativeBuild
 .cxx
 /livekit-lint/bin
+local-config.json
 
 ### Changesets
 node_modules/

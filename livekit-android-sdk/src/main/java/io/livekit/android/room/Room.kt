@@ -21,6 +21,7 @@ package io.livekit.android.room
 import android.content.Context
 import android.net.ConnectivityManager.NetworkCallback
 import android.net.Network
+import android.net.NetworkCapabilities
 import androidx.annotation.VisibleForTesting
 import dagger.assisted.Assisted
 import dagger.assisted.AssistedFactory
@@ -50,6 +51,7 @@ import io.livekit.android.renderer.TextureViewRenderer
 import io.livekit.android.room.datastream.incoming.IncomingDataStreamManager
 import io.livekit.android.room.metrics.collectMetrics
 import io.livekit.android.room.network.NetworkCallbackManagerFactory
+import io.livekit.android.room.network.ReconnectPolicy
 import io.livekit.android.room.participant.AudioTrackPublishDefaults
 import io.livekit.android.room.participant.ConnectionQuality
 import io.livekit.android.room.participant.LocalParticipant
@@ -318,6 +320,11 @@ constructor(
      */
     var screenShareTrackPublishDefaults: VideoTrackPublishDefaults by defaultsManager::screenShareTrackPublishDefaults
 
+    /**
+     * [ReconnectPolicy] to use when reconnecting to the server.
+     */
+    var reconnectPolicy: ReconnectPolicy by engine::reconnectPolicy
+
     val localParticipant: LocalParticipant = localParticipantFactory.create(dynacast = false).apply {
         internalListener = this@Room
         setRoom(this@Room)
@@ -356,7 +363,11 @@ constructor(
         private set
 
     @Volatile
-    private var hasLostConnectivity: Boolean = false
+    private var activeNetwork: Network? = null
+
+    @Volatile
+    private var pendingRestartNetwork: Network? = null
+
     private var connectOptions: ConnectOptions = ConnectOptions()
 
     private var stateLock = Mutex()
@@ -619,6 +630,9 @@ constructor(
         }
         options.screenShareTrackPublishDefaults?.let {
             screenShareTrackPublishDefaults = it
+        }
+        options.reconnectPolicy?.let {
+            reconnectPolicy = it
         }
         adaptiveStream = options.adaptiveStream
         dynacast = options.dynacast
@@ -1007,11 +1021,20 @@ constructor(
         eventBus.postEvent(RoomEvent.ActiveSpeakersChanged(this, mutableActiveSpeakers), coroutineScope)
     }
 
-    private fun reconnect() {
+    private fun reconnect(networkHandle: Long = 0, reason: String = "unspecified") {
+        LKLog.i {
+            "[reconnect][net] reconnect requested, networkHandle=$networkHandle, " +
+                "state=$state, activeNetwork=$activeNetwork, reason=$reason"
+        }
         if (state == State.RECONNECTING) {
+            LKLog.i { "[reconnect][net] reconnect skipped: state already RECONNECTING, reason=$reason" }
             return
         }
-        engine.reconnect()
+        if (activeNetwork == null) {
+            LKLog.i { "[reconnect][net] reconnect deferred: no active network, reason=$reason" }
+            return
+        }
+        engine.reconnect(networkHandle, reason)
     }
 
     private fun handleDisconnect(reason: DisconnectReason) {
@@ -1024,7 +1047,8 @@ constructor(
                     return@runBlocking
                 }
                 networkCallbackManager.unregisterCallback()
-                hasLostConnectivity = false
+                activeNetwork = null
+                pendingRestartNetwork = null
 
                 state = State.DISCONNECTED
                 cleanupRoom()
@@ -1155,22 +1179,45 @@ constructor(
     // ------------------------------------- NetworkCallback -------------------------------------//
     private val networkCallbackManager = networkCallbackManagerFactory.invoke(
         object : NetworkCallback() {
-            override fun onLost(network: Network) {
-                LKLog.i { "network connection onLost, hasLostConnectivity=$hasLostConnectivity, network=[$network]" }
+            override fun onAvailable(network: Network) {
+                LKLog.i { "[reconnect][net] network onAvailable, network=$network, activeNetwork=$activeNetwork" }
 
-                // lost connection, flip to reconnecting
-                hasLostConnectivity = true
+                val prev = activeNetwork
+                activeNetwork = network
+                if (prev != network) {
+                    pendingRestartNetwork = network
+                    LKLog.i { "[reconnect][net] network changed, waiting for readiness, network=$network" }
+                }
             }
 
-            override fun onAvailable(network: Network) {
-                LKLog.i { "network connection onAvailable, hasLostConnectivity=$hasLostConnectivity , network=[$network]" }
-                // only actually reconnect after connection is re-established
-                if (!hasLostConnectivity) {
+            override fun onLost(network: Network) {
+                LKLog.i { "[reconnect][net] network onLost, network=$network, activeNetwork=$activeNetwork" }
+
+                if (network == activeNetwork) {
+                    activeNetwork = null
+                    pendingRestartNetwork = null
+                }
+            }
+
+            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                LKLog.d { "[reconnect][net] onCapabilitiesChanged, network=$network, pendingRestartNetwork=$pendingRestartNetwork, caps=$caps" }
+                activeNetwork = network
+
+                if (network != pendingRestartNetwork) {
+                    return
+                }
+                pendingRestartNetwork = null
+
+                if (state != State.CONNECTED) {
+                    LKLog.d { "[reconnect][net] network ready but state=$state, skipping reconnect, network=$network" }
                     return
                 }
 
-                hasLostConnectivity = false
-                reconnect()
+                LKLog.i {
+                    "[reconnect][net] network ready, scheduling reconnect, network=$network, " +
+                        "networkHandle=${network.networkHandle}, state=$state, useQuic=${connectOptions.useQuicSignal}"
+                }
+                reconnect(network.networkHandle, reason = "network capabilities changed")
             }
         },
     )
@@ -1482,6 +1529,14 @@ constructor(
     /**
      * @suppress
      */
+    override fun onEngineConnectionLost(reason: String) {
+        LKLog.i { "[reconnect][net] engine connection lost callback received, reason=$reason" }
+        reconnect(reason = reason)
+    }
+
+    /**
+     * @suppress
+     */
     override fun onEngineDisconnected(reason: DisconnectReason) {
         LKLog.v { "engine did disconnect: $reason" }
         handleDisconnect(reason)
@@ -1705,6 +1760,18 @@ sealed class RoomException(message: String? = null, cause: Throwable? = null) :
 
     class StartCallException(message: String? = null, cause: Throwable? = null, val statusCode: Int? = null) :
         RoomException(message, cause)
+
+    /**
+     * Thrown when establishing the signal connection times out.
+     *
+     * Wraps the underlying [kotlinx.coroutines.TimeoutCancellationException] so callers
+     * can catch it as a regular [RoomException] without depending on coroutine internals.
+     */
+    class ConnectTimeoutException(
+        message: String? = null,
+        cause: Throwable? = null,
+        val timeoutMs: Long? = null,
+    ) : RoomException(message, cause)
 }
 
 internal fun unpackStreamId(packed: String): Pair<String, String?> {
