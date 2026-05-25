@@ -45,6 +45,7 @@ class QuicWithFallbackTransport(
 
     override val attemptId: Long get() = quicTransport.attemptId
     override val sendOnOpen: ByteString? get() = quicTransport.sendOnOpen
+    override val isFallbackTransport: Boolean get() = hasFallenBack
 
     private val callbackExecutor: ExecutorService =
         Executors.newSingleThreadExecutor { r ->

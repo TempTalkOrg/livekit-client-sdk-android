@@ -87,6 +87,10 @@ constructor(
         private set
 
     @Volatile
+    internal var isQuicMarkedUnhealthy = false
+        private set
+
+    @Volatile
     private var transport: SignalTransport? = null
 
     @Volatile
@@ -203,8 +207,9 @@ constructor(
         // Clean up any pre-existing connection.
         close(reason = "Starting new connection", shouldClearQueuedRequests = false)
 
-        val wsUrlString = "${url.toWebsocketUrl()}/rtc${createConnectionParams(token, getClientInfo(), options, roomOptions)}"
-        isReconnecting = options.reconnect
+        val effectiveOptions = effectiveConnectOptions(options)
+        val wsUrlString = "${url.toWebsocketUrl()}/rtc${createConnectionParams(token, getClientInfo(), effectiveOptions, roomOptions)}"
+        isReconnecting = effectiveOptions.reconnect
 
         LKLog.i { "connecting to $wsUrlString" }
 
@@ -231,13 +236,31 @@ constructor(
 
         try {
             LKLog.i { "[reconnect][signal] connect - in, attempt=$attemptId" }
-            val ret = connectWithTimeout(15 * 1000, wsUrlString, token, options, attemptId, sendOnOpen)
+            val ret = connectWithTimeout(15 * 1000, wsUrlString, token, effectiveOptions, attemptId, sendOnOpen)
             LKLog.i { "[reconnect][signal] connect - out, attempt=$attemptId" }
             return ret
         } catch (t: Throwable) {
             LKLog.i { "[reconnect][signal] connect - out with exception, attempt=$attemptId" }
             throw t
         }
+    }
+
+    private fun effectiveConnectOptions(options: ConnectOptions): ConnectOptions {
+        if (!isQuicMarkedUnhealthy || !options.useQuicSignal) {
+            return options
+        }
+
+        return options.copy(useQuicSignal = false).apply {
+            reconnect = options.reconnect
+            participantSid = options.participantSid
+        }
+    }
+
+    internal fun resetQuicHealthForNewSession() {
+        if (!isQuicMarkedUnhealthy) return
+
+        isQuicMarkedUnhealthy = false
+        LKLog.i { "[transport] resetting QUIC unhealthy marker for new session" }
     }
 
     private suspend fun connectWithTimeout(
@@ -433,9 +456,23 @@ constructor(
             return
         }
 
+        markQuicUnhealthyIfFallback(transport)
+
         transport.sendOnOpen?.let { req ->
             transport.send(req)
         }
+    }
+
+    private fun markQuicUnhealthyIfFallback(transport: SignalTransport) {
+        if (!transport.isFallbackTransport) {
+            return
+        }
+        if (isQuicMarkedUnhealthy) {
+            return
+        }
+
+        isQuicMarkedUnhealthy = true
+        LKLog.w { "[transport] marking QUIC unhealthy for this session; using WebSocket later" }
     }
 
     override fun onMessage(transport: SignalTransport, message: ByteString) {

@@ -16,6 +16,7 @@
 
 package io.livekit.android.room.metrics
 
+import io.livekit.android.room.ConnectionState
 import io.livekit.android.room.RTCEngine
 import io.livekit.android.room.Room
 import io.livekit.android.room.participant.Participant
@@ -49,6 +50,12 @@ internal suspend fun collectMetrics(room: Room, rtcEngine: RTCEngine) = coroutin
 private suspend fun collectPublisherMetrics(room: Room, rtcEngine: RTCEngine) {
     while (currentCoroutineContext().isActive) {
         delay(1000)
+        // Skip stats collection while not in a steady connected state. During
+        // RESUMING / RECONNECTING the underlying PeerConnection is .failed and
+        // the synchronous getStats() BlockingCall just piles pressure onto the
+        // WebRTC signaling/worker threads without producing actionable data.
+        // See Docs/reconnect-metrics-storm-and-worker-crash-fix.md (Fix-8).
+        if (rtcEngine.connectionState != ConnectionState.CONNECTED) continue
         val report = suspendCancellableCoroutine { cont ->
             room.getPublisherRTCStats { cont.resume(it) }
         }
@@ -81,6 +88,8 @@ private suspend fun collectPublisherMetrics(room: Room, rtcEngine: RTCEngine) {
 private suspend fun collectSubscriberMetrics(room: Room, rtcEngine: RTCEngine) {
     while (currentCoroutineContext().isActive) {
         delay(1000)
+        // See collectPublisherMetrics above for rationale (Fix-8).
+        if (rtcEngine.connectionState != ConnectionState.CONNECTED) continue
         val report = suspendCancellableCoroutine { cont ->
             room.getSubscriberRTCStats { cont.resume(it) }
         }

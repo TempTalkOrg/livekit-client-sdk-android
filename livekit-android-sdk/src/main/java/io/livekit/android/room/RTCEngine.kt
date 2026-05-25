@@ -736,6 +736,7 @@ internal constructor(
                     val shouldTryQuicRestart =
                         attemptNetworkHandle != 0L &&
                             connectOptions.useQuicSignal &&
+                            !client.isQuicMarkedUnhealthy &&
                             client.isConnected
                     if (shouldTryQuicRestart) {
                         LKLog.i {
@@ -744,7 +745,7 @@ internal constructor(
                         }
                         val restartOk = tryQuicRestart(attemptNetworkHandle)
                         if (restartOk) {
-                            LKLog.i { "[reconnect][quic][${retries + 1}] QUIC restart succeeded, starting ICE restart" }
+                            LKLog.i { "[reconnect][quic][${retries + 1}] QUIC restart succeeded, keeping signal session" }
                             listener?.onSignalConnected(true)
                             // The server-side iceLite bug that caused subscriber candidate-pair selection to fail has been fixed, so an ICE restart is no longer needed here.
 //                            if (hasPublished) {
@@ -950,7 +951,15 @@ internal constructor(
 
                 if (dataPacket.kind == LivekitModels.DataPacket.Kind.RELIABLE) {
                     reliableMessageBuffer.queue(DataPacketItem(byteBuffer, dataPacket.sequence))
-                    if (this.connectionState == ConnectionState.RECONNECTING) {
+                    // Buffer reliable messages during both full (RECONNECTING) and quick
+                    // (RESUMING) reconnect. The reliable buffer is replayed by
+                    // resendReliableMessagesForResume once the publisher reconnects, so
+                    // callers don't lose data and we avoid sending into a torn-down
+                    // DataChannel mid-reconnect.
+                    // See Docs/reconnect-metrics-storm-and-worker-crash-fix.md (Fix-7).
+                    if (this.connectionState == ConnectionState.RECONNECTING ||
+                        this.connectionState == ConnectionState.RESUMING
+                    ) {
                         return Result.success(Unit)
                     }
                 }

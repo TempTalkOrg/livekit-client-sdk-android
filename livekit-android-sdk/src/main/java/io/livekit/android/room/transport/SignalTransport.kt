@@ -28,6 +28,8 @@ interface SignalTransport {
 
     val attemptId: Long
     val sendOnOpen: ByteString?
+    val isFallbackTransport: Boolean
+        get() = false
 
     fun interface Factory {
         fun create(
