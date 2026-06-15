@@ -42,6 +42,7 @@ import io.livekit.android.sample.dialog.showAudioProcessorSwitchDialog
 import io.livekit.android.sample.dialog.showDebugMenuDialog
 import io.livekit.android.sample.dialog.showSelectAudioDeviceDialog
 import io.livekit.android.sample.model.StressTest
+import io.livekit.android.sample.proxy.ProxyConfig
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.parcelize.Parcelize
@@ -66,6 +67,14 @@ class CallActivity : AppCompatActivity() {
             quicCidTag = args.quicCidTag,
             serverHost = args.serverHost,
             caCertPem = args.caCertPem,
+            proxyConfig = ProxyConfig.fromInputs(
+                enabled = args.proxyEnabled,
+                host = args.proxyHost,
+                port = args.proxyPort,
+                spkiPinBase64 = args.proxySpkiPin,
+                turnSecret = args.proxyTurnSecret,
+                sni = args.proxySni,
+            ),
             stressTest = args.stressTest,
             application = application,
             audioProcessorOptions = AudioProcessorOptions(
@@ -405,6 +414,12 @@ class CallActivity : AppCompatActivity() {
         val quicCidTag: String,
         val serverHost: String = "",
         val caCertPem: String = "",
+        val proxyEnabled: Boolean = false,
+        val proxyHost: String = "",
+        val proxyPort: Int = ProxyConfig.DEFAULT_PORT,
+        val proxySpkiPin: String = "",
+        val proxyTurnSecret: String = "",
+        val proxySni: String = "",
         val stressTest: StressTest,
     ) : Parcelable
 }

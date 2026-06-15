@@ -25,6 +25,7 @@ import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
 import io.livekit.android.sample.databinding.MainActivityBinding
 import io.livekit.android.sample.model.StressTest
+import io.livekit.android.sample.proxy.ProxyConfig
 import io.livekit.android.sample.util.requestNeededPermissions
 
 class MainActivity : AppCompatActivity() {
@@ -42,6 +43,19 @@ class MainActivity : AppCompatActivity() {
 
         val selectedPreset = viewModel.getSelectedPreset()
         binding.presetDropdown.setText(selectedPreset.label, false)
+
+        // RTC proxy dropdown: "No Proxy" + each proxy defined in local-config.json.
+        val proxies = viewModel.proxies
+        val proxyLabels = (listOf(MainViewModel.PROXY_LABEL_NONE) + proxies.map { it.label }).toTypedArray()
+        val proxyAdapter = ArrayAdapter(this, android.R.layout.simple_dropdown_item_1line, proxyLabels)
+        binding.rtcProxyDropdown.setAdapter(proxyAdapter)
+        val selectedProxyLabel = viewModel.getSelectedProxy()?.label ?: MainViewModel.PROXY_LABEL_NONE
+        binding.rtcProxyDropdown.setText(selectedProxyLabel, false)
+
+        fun selectedProxy(): ProxyPreset? {
+            val label = binding.rtcProxyDropdown.text.toString()
+            return proxies.find { it.label == label }
+        }
 
         val e2EEOn = viewModel.getE2EEOptionsOn()
         val e2EEKey = viewModel.getSavedE2EEKey()
@@ -67,6 +81,7 @@ class MainActivity : AppCompatActivity() {
                     quicDeviceType.editText?.text?.toString()?.toIntOrNull()
                         ?: MainViewModel.DEFAULT_QUIC_DEVICE_TYPE
                 val quicCidTagStr = quicCidTag.editText?.text?.toString().orEmpty()
+                val proxy = selectedProxy()
                 val intent = Intent(this@MainActivity, CallActivity::class.java).apply {
                     putExtra(
                         CallActivity.KEY_ARGS,
@@ -80,6 +95,12 @@ class MainActivity : AppCompatActivity() {
                             quicCidTag = quicCidTagStr,
                             serverHost = preset.serverHost,
                             caCertPem = preset.caCertPem,
+                            proxyEnabled = proxy != null,
+                            proxyHost = proxy?.host.orEmpty(),
+                            proxyPort = proxy?.port ?: ProxyConfig.DEFAULT_PORT,
+                            proxySpkiPin = proxy?.spkiPin.orEmpty(),
+                            proxyTurnSecret = proxy?.turnSecret.orEmpty(),
+                            proxySni = proxy?.sni.orEmpty(),
                             stressTest = StressTest.None,
                         ),
                     )
@@ -101,6 +122,7 @@ class MainActivity : AppCompatActivity() {
                         ?: MainViewModel.DEFAULT_QUIC_DEVICE_TYPE,
                 )
                 viewModel.setQuicCidTag(quicCidTag.editText?.text?.toString().orEmpty())
+                viewModel.setSavedProxyId(selectedProxy()?.id ?: MainViewModel.PROXY_ID_NONE)
 
                 Toast.makeText(
                     this@MainActivity,
@@ -119,6 +141,7 @@ class MainActivity : AppCompatActivity() {
                 quicDeviceType.editText?.text =
                     SpannableStringBuilder(MainViewModel.DEFAULT_QUIC_DEVICE_TYPE.toString())
                 quicCidTag.editText?.text = SpannableStringBuilder(MainViewModel.DEFAULT_QUIC_CID_TAG)
+                rtcProxyDropdown.setText(MainViewModel.PROXY_LABEL_NONE, false)
 
                 Toast.makeText(
                     this@MainActivity,

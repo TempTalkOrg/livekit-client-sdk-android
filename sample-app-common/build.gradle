@@ -15,6 +15,7 @@ def ttParsed = ttConfigFile.exists() ? new groovy.json.JsonSlurper().parse(ttCon
 // Support both formats: bare array of presets (legacy) or { presets, settings }
 def ttPresets = (ttParsed instanceof List) ? ttParsed : (ttParsed?.presets ?: null)
 def ttSettings = (ttParsed instanceof List || ttParsed == null) ? [:] : (ttParsed?.settings ?: [:])
+def ttProxies = (ttParsed instanceof List || ttParsed == null) ? null : (ttParsed?.proxies ?: null)
 
 // --- Derive BuildConfig values (tt.json > gradle.properties > hardcoded default) ---
 
@@ -76,6 +77,10 @@ if (ttPresets != null) {
 }
 final presetsJson = presetsJsonRaw.replace('\\', '\\\\').replace('"', '\\"')
 
+// --- Proxies JSON (RTC media TURN relay presets) ---
+def proxiesJsonRaw = (ttProxies != null) ? groovy.json.JsonOutput.toJson(ttProxies) : "[]"
+final proxiesJson = proxiesJsonRaw.replace('\\', '\\\\').replace('"', '\\"')
+
 // ---------------------------------------------------------------------------
 
 android {
@@ -106,6 +111,7 @@ android {
             buildConfigField "int", "DEFAULT_QUIC_DEVICE_TYPE", "${quicDeviceType}"
             buildConfigField "String", "DEFAULT_QUIC_CID_TAG", "\"${quicCidTag}\""
             buildConfigField "String", "SAMPLE_PRESETS_JSON", "\"${presetsJson}\""
+            buildConfigField "String", "SAMPLE_PROXIES_JSON", "\"${proxiesJson}\""
         }
 
         debug {
@@ -120,6 +126,7 @@ android {
             buildConfigField "int", "DEFAULT_QUIC_DEVICE_TYPE", "${quicDeviceType}"
             buildConfigField "String", "DEFAULT_QUIC_CID_TAG", "\"${quicCidTag}\""
             buildConfigField "String", "SAMPLE_PRESETS_JSON", "\"${presetsJson}\""
+            buildConfigField "String", "SAMPLE_PROXIES_JSON", "\"${proxiesJson}\""
         }
     }
     buildFeatures {

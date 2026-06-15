@@ -27,6 +27,7 @@ import io.livekit.android.room.participant.Participant
 import io.livekit.android.room.track.CameraPosition
 import io.livekit.android.room.track.LocalVideoTrack
 import io.livekit.android.room.track.Track
+import io.livekit.android.room.track.TrackPublication
 import io.livekit.android.room.track.VideoTrack
 import io.livekit.android.sample.databinding.ParticipantItemBinding
 import io.livekit.android.util.LKLog
@@ -49,12 +50,14 @@ class ParticipantItem(
     private val speakerView: Boolean = false,
 ) : BindableItem<ParticipantItemBinding>() {
 
-    private var boundVideoTrack: VideoTrack? = null
+    private var boundMainVideoTrack: VideoTrack? = null
+    private var boundCameraVideoTrack: VideoTrack? = null
     private var coroutineScope: CoroutineScope? = null
 
     override fun initializeViewBinding(view: View): ParticipantItemBinding {
         val binding = ParticipantItemBinding.bind(view)
         room.initVideoRenderer(binding.renderer)
+        room.initVideoRenderer(binding.cameraRenderer)
 
         return binding
     }
@@ -99,29 +102,43 @@ class ParticipantItem(
         val videoTrackPubFlow = participant::videoTrackPublications.flow
             .map { participant to it }
             .flatMapLatest { (participant, videoTracks) ->
-                // Prioritize any screenshare streams.
-                val trackPublication = participant.getTrackPublication(Track.Source.SCREEN_SHARE)
-                    ?: participant.getTrackPublication(Track.Source.CAMERA)
-                    ?: videoTracks.firstOrNull()?.first
+                val screenSharePublication = participant.getTrackPublication(Track.Source.SCREEN_SHARE)
+                val cameraPublication = participant.getTrackPublication(Track.Source.CAMERA)
+                    ?: videoTracks.firstOrNull { (publication) -> publication.source != Track.Source.SCREEN_SHARE }?.first
 
-                flowOf(trackPublication)
+                flowOf(VideoPublications(screenShare = screenSharePublication, camera = cameraPublication))
             }
 
         coroutineScope?.launch {
-            val videoTrackFlow = videoTrackPubFlow
-                .flatMapLatestOrNull { pub -> pub::track.flow }
+            val mainVideoTrackFlow = videoTrackPubFlow
+                .map { publications -> publications.screenShare ?: publications.camera }
+                .flatMapLatestOrNull { publication -> publication::track.flow }
+            val cameraVideoTrackFlow = videoTrackPubFlow
+                .map { publications ->
+                    if (publications.screenShare != null && publications.camera != null) {
+                        publications.camera
+                    } else {
+                        null
+                    }
+                }
+                .flatMapLatestOrNull { publication -> publication::track.flow }
 
             // Configure video view with track
             launch {
-                videoTrackFlow.collectLatest { videoTrack ->
-                    setupVideoIfNeeded(videoTrack as? VideoTrack, viewBinding)
+                mainVideoTrackFlow.collectLatest { videoTrack ->
+                    setupMainVideoIfNeeded(videoTrack as? VideoTrack, viewBinding)
+                }
+            }
+            launch {
+                cameraVideoTrackFlow.collectLatest { videoTrack ->
+                    setupCameraVideoIfNeeded(videoTrack as? VideoTrack, viewBinding)
                 }
             }
 
             // For local participants, mirror camera if using front camera.
             if (participant == room.localParticipant) {
                 launch {
-                    videoTrackFlow
+                    mainVideoTrackFlow
                         .flatMapLatestOrNull { track -> (track as LocalVideoTrack)::options.flow }
                         .collectLatest { options ->
                             viewBinding.renderer.setMirror(options?.position == CameraPosition.FRONT)
@@ -133,14 +150,28 @@ class ParticipantItem(
         // Handle muted changes
         coroutineScope?.launch {
             videoTrackPubFlow
-                .flatMapLatestOrNull { pub -> pub::muted.flow }
-                .collectLatest { muted ->
-                    viewBinding.renderer.visibleOrInvisible(!(muted ?: true))
+                .map { publications -> publications.screenShare ?: publications.camera }
+                .flatMapLatestOrNull { publication ->
+                    publication::muted.flow.map { muted -> publication to muted }
+                }
+                .collectLatest { publicationAndMuted ->
+                    val (publication, muted) = publicationAndMuted ?: return@collectLatest
+                    val keepCameraRendererVisible = publication.source == Track.Source.CAMERA
+                    viewBinding.renderer.visibleOrInvisible(keepCameraRendererVisible || !muted)
+                }
+        }
+        coroutineScope?.launch {
+            videoTrackPubFlow
+                .map { publications ->
+                    publications.screenShare != null && publications.camera?.track != null
+                }
+                .collectLatest { hasCameraInset ->
+                    viewBinding.cameraRenderer.visibleOrGone(hasCameraInset)
                 }
         }
         val existingTrack = getVideoTrack()
         if (existingTrack != null) {
-            setupVideoIfNeeded(existingTrack, viewBinding)
+            setupMainVideoIfNeeded(existingTrack, viewBinding)
         }
     }
 
@@ -148,22 +179,34 @@ class ParticipantItem(
         return participant.getTrackPublication(Track.Source.CAMERA)?.track as? VideoTrack
     }
 
-    private fun setupVideoIfNeeded(videoTrack: VideoTrack?, viewBinding: ParticipantItemBinding) {
-        if (boundVideoTrack == videoTrack) {
+    private fun setupMainVideoIfNeeded(videoTrack: VideoTrack?, viewBinding: ParticipantItemBinding) {
+        if (boundMainVideoTrack == videoTrack) {
             return
         }
-        boundVideoTrack?.removeRenderer(viewBinding.renderer)
-        boundVideoTrack = videoTrack
-        LKLog.v { "adding renderer to $videoTrack" }
+        boundMainVideoTrack?.removeRenderer(viewBinding.renderer)
+        boundMainVideoTrack = videoTrack
+        LKLog.v { "adding main renderer to $videoTrack" }
         videoTrack?.addRenderer(viewBinding.renderer)
+    }
+
+    private fun setupCameraVideoIfNeeded(videoTrack: VideoTrack?, viewBinding: ParticipantItemBinding) {
+        if (boundCameraVideoTrack == videoTrack) {
+            return
+        }
+        boundCameraVideoTrack?.removeRenderer(viewBinding.cameraRenderer)
+        boundCameraVideoTrack = videoTrack
+        LKLog.v { "adding camera inset renderer to $videoTrack" }
+        videoTrack?.addRenderer(viewBinding.cameraRenderer)
     }
 
     override fun unbind(viewHolder: GroupieViewHolder<ParticipantItemBinding>) {
         coroutineScope?.cancel()
         coroutineScope = null
         super.unbind(viewHolder)
-        boundVideoTrack?.removeRenderer(viewHolder.binding.renderer)
-        boundVideoTrack = null
+        boundMainVideoTrack?.removeRenderer(viewHolder.binding.renderer)
+        boundCameraVideoTrack?.removeRenderer(viewHolder.binding.cameraRenderer)
+        boundMainVideoTrack = null
+        boundCameraVideoTrack = null
     }
 
     override fun getLayout(): Int =
@@ -173,6 +216,11 @@ class ParticipantItem(
             R.layout.participant_item
         }
 }
+
+private data class VideoPublications(
+    val screenShare: TrackPublication?,
+    val camera: TrackPublication?,
+)
 
 private fun View.visibleOrGone(visible: Boolean) {
     visibility = if (visible) {

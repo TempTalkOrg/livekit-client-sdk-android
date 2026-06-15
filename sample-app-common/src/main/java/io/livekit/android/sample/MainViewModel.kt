@@ -29,6 +29,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     val presets: List<ConnectionPreset> = parsePresets()
 
+    val proxies: List<ProxyPreset> = parseProxies()
+
     fun getSavedPresetId(): String {
         val savedId = preferences.getString(PREFERENCES_KEY_PRESET_ID, null)
         return if (savedId != null && presets.any { it.id == savedId }) {
@@ -56,6 +58,27 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun getSavedE2EEKey() = preferences.getString(PREFERENCES_KEY_E2EE_KEY, E2EE_KEY) as String
     fun getQuicDeviceType() = preferences.getInt(PREFERENCES_KEY_QUIC_DEVICE_TYPE, DEFAULT_QUIC_DEVICE_TYPE)
     fun getQuicCidTag() = preferences.getString(PREFERENCES_KEY_QUIC_CID_TAG, DEFAULT_QUIC_CID_TAG) ?: DEFAULT_QUIC_CID_TAG
+
+    /** Selected RTC proxy id, or [PROXY_ID_NONE] when media should not be relayed. */
+    fun getSavedProxyId(): String {
+        val savedId = preferences.getString(PREFERENCES_KEY_RTC_PROXY_ID, PROXY_ID_NONE)
+        return if (savedId == PROXY_ID_NONE || proxies.any { it.id == savedId }) {
+            savedId ?: PROXY_ID_NONE
+        } else {
+            PROXY_ID_NONE
+        }
+    }
+
+    fun getProxyById(id: String): ProxyPreset? = proxies.find { it.id == id }
+
+    /** The currently selected proxy, or null when "No Proxy" is selected. */
+    fun getSelectedProxy(): ProxyPreset? = getProxyById(getSavedProxyId())
+
+    fun setSavedProxyId(id: String) {
+        preferences.edit {
+            putString(PREFERENCES_KEY_RTC_PROXY_ID, id)
+        }
+    }
 
     fun setSavedUrl(url: String) {
         preferences.edit {
@@ -105,6 +128,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         private const val PREFERENCES_KEY_E2EE_KEY = "e2ee_key"
         private const val PREFERENCES_KEY_QUIC_DEVICE_TYPE = "quic_device_type"
         private const val PREFERENCES_KEY_QUIC_CID_TAG = "quic_cid_tag"
+        private const val PREFERENCES_KEY_RTC_PROXY_ID = "rtc_proxy_id"
+
+        /** Sentinel proxy id meaning "do not relay media through any proxy". */
+        const val PROXY_ID_NONE = "none"
+        const val PROXY_LABEL_NONE = "No Proxy"
 
         const val URL = BuildConfig.DEFAULT_URL
         const val TOKEN = BuildConfig.DEFAULT_TOKEN
@@ -126,6 +154,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         token = TOKEN,
                     ),
                 )
+            }
+        }
+
+        private fun parseProxies(): List<ProxyPreset> {
+            return try {
+                json.decodeFromString<List<ProxyPreset>>(BuildConfig.SAMPLE_PROXIES_JSON)
+            } catch (_: Exception) {
+                emptyList()
             }
         }
     }

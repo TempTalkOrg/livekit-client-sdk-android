@@ -42,8 +42,11 @@ class DataPacketCryptorMockE2ETest : MockE2ETest() {
     lateinit var pubDataChannel: MockDataChannel
     lateinit var subDataChannel: MockDataChannel
 
-    override suspend fun connect(joinResponse: LivekitRtc.SignalResponse) {
-        super.connect(joinResponse)
+    override suspend fun connect(
+        joinResponse: LivekitRtc.SignalResponse,
+        connectOptions: io.livekit.android.ConnectOptions,
+    ) {
+        super.connect(joinResponse, connectOptions)
 
         val pubPeerConnection = component.rtcEngine().getPublisherPeerConnection() as MockPeerConnection
         pubDataChannel = pubPeerConnection.dataChannels[RTCEngine.RELIABLE_DATA_CHANNEL_LABEL] as MockDataChannel

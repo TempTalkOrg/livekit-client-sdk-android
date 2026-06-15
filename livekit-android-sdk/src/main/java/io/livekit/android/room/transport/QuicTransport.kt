@@ -82,6 +82,12 @@ class QuicTransport(
             cidTag = options.quicCidTag
             serverHost = options.serverHost ?: hostname
             caCertPem = options.caCertPem ?: ""
+            proxyUrl = options.quicProxyUrl ?: ""
+            proxyHost = options.quicProxyHost ?: ""
+            proxyPort = options.quicProxyPort
+            proxySni = options.quicProxySni ?: ""
+            proxyCaCertPem = options.quicProxyCaCertPem ?: ""
+            spkiPin = options.quicProxySpkiPin ?: ""
             alpn = "ttsignal"
         }
 

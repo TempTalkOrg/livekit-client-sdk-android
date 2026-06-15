@@ -59,6 +59,7 @@ import io.livekit.android.room.track.screencapture.ScreenCaptureParams
 import io.livekit.android.room.track.video.CameraCapturerUtils
 import io.livekit.android.sample.common.BuildConfig
 import io.livekit.android.sample.model.StressTest
+import io.livekit.android.sample.proxy.ProxyConfig
 import io.livekit.android.sample.service.ForegroundService
 import io.livekit.android.util.LKLog
 import io.livekit.android.util.flow
@@ -132,6 +133,7 @@ class CallViewModel(
     val quicCidTag: String = "",
     val serverHost: String = "",
     val caCertPem: String = "",
+    val proxyConfig: ProxyConfig? = null,
     val audioProcessorOptions: AudioProcessorOptions? = null,
     val stressTest: StressTest = StressTest.None,
 ) : AndroidViewModel(application) {
@@ -148,6 +150,20 @@ class CallViewModel(
     }
 
     private fun getConnectOptions(): ConnectOptions {
+        // RTC proxy: when configured, force WebRTC media through the operator's TURN
+        // relay (relay-only ICE) with an SPKI-pinned outer TLS. Both derive from the
+        // same config so they cannot drift. Null when the proxy is disabled.
+        val proxyRtcConfig = proxyConfig?.buildRtcConfig()
+        val proxyTlsVerifier = proxyConfig?.createTurnTlsVerifier()
+
+        // QUIC-over-proxy (MASQUE CONNECT-UDP): when a proxy is selected and QUIC
+        // signaling is on, tunnel the QUIC signaling through the same proxy host,
+        // SPKI-pinning the outer hop. Ignored by the SDK unless useQuicSignal=true.
+        val quicProxyHost = proxyConfig?.host
+        val quicProxyPort = proxyConfig?.port ?: 0
+        val quicProxySni = proxyConfig?.outerSni()
+        val quicProxySpkiPin = proxyConfig?.spkiPinBase64
+
         if (!BuildConfig.USE_MERGE_START_CALL || BuildConfig.MERGE_START_CALL_PARAM.isNullOrBlank()) {
             return ConnectOptions(
                 useQuicSignal = quic,
@@ -155,6 +171,12 @@ class CallViewModel(
                 quicCidTag = quicCidTag,
                 serverHost = serverHost.ifEmpty { null },
                 caCertPem = caCertPem.ifEmpty { null },
+                rtcConfig = proxyRtcConfig,
+                sslCertificateVerifier = proxyTlsVerifier,
+                quicProxyHost = quicProxyHost,
+                quicProxyPort = quicProxyPort,
+                quicProxySni = quicProxySni,
+                quicProxySpkiPin = quicProxySpkiPin,
             )
         }
         val param = Json.decodeFromString<MergeStartCallParam>(BuildConfig.MERGE_START_CALL_PARAM)
@@ -204,6 +226,12 @@ class CallViewModel(
             quicCidTag = quicCidTag,
             serverHost = serverHost.ifEmpty { null },
             caCertPem = caCertPem.ifEmpty { null },
+            rtcConfig = proxyRtcConfig,
+            sslCertificateVerifier = proxyTlsVerifier,
+            quicProxyHost = quicProxyHost,
+            quicProxyPort = quicProxyPort,
+            quicProxySni = quicProxySni,
+            quicProxySpkiPin = quicProxySpkiPin,
         )
     }
 
@@ -250,7 +278,7 @@ class CallViewModel(
                 audioProcessorOptions = audioProcessorOptions,
             ),
         ),
-    )
+    ).apply { enableMetrics = true }
 
     private var curretnRotation: Int? = null
 

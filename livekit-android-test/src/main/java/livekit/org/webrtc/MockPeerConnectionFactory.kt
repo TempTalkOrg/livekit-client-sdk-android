@@ -23,12 +23,23 @@ import io.livekit.android.test.mock.MockVideoSource
 import io.livekit.android.test.mock.MockVideoStreamTrack
 
 class MockPeerConnectionFactory : PeerConnectionFactory(1L) {
+    /**
+     * The [SSLCertificateVerifier] passed to the most recent PeerConnection creation.
+     * Lets tests assert the verifier is threaded through (non-null = the deps overload
+     * was taken) or absent (null = the backward-compat no-deps overload). See
+     * RTCEngineSslVerifierMockE2ETest.
+     */
+    @Volatile
+    var lastSslCertificateVerifier: SSLCertificateVerifier? = null
+        private set
+
     override fun createPeerConnectionInternal(
         rtcConfig: PeerConnection.RTCConfiguration,
         constraints: MediaConstraints?,
         observer: PeerConnection.Observer?,
         sslCertificateVerifier: SSLCertificateVerifier?,
     ): PeerConnection {
+        lastSslCertificateVerifier = sslCertificateVerifier
         return MockPeerConnection(rtcConfig, observer)
     }
 

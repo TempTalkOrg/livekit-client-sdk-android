@@ -48,6 +48,13 @@ public class Config {
     public String serverHost = "";
     // Self-signed root CA certificate in PEM format for custom certificate chain verification
     public String caCertPem = "";
+    // Per-connection outbound proxy (RFC 9298 CONNECT-UDP / MASQUE)
+    public String proxyUrl = "";
+    public String proxyHost = "";
+    public int    proxyPort = 0;
+    public String proxySni = "";
+    public String proxyCaCertPem = "";
+    public String spkiPin = "";
 
     public Config() {
         // Default constructor

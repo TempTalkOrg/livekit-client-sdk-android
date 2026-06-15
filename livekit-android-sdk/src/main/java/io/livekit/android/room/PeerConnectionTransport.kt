@@ -53,8 +53,10 @@ import livekit.org.webrtc.MediaConstraints
 import livekit.org.webrtc.PeerConnection
 import livekit.org.webrtc.PeerConnection.RTCConfiguration
 import livekit.org.webrtc.PeerConnection.SignalingState
+import livekit.org.webrtc.PeerConnectionDependencies
 import livekit.org.webrtc.PeerConnectionFactory
 import livekit.org.webrtc.RtpTransceiver
+import livekit.org.webrtc.SSLCertificateVerifier
 import livekit.org.webrtc.SessionDescription
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -73,6 +75,7 @@ constructor(
     @Assisted config: RTCConfiguration,
     @Assisted pcObserver: PeerConnection.Observer,
     @Assisted private val listener: Listener?,
+    @Assisted private val sslCertificateVerifier: SSLCertificateVerifier?,
     @Named(InjectionNames.DISPATCHER_IO)
     private val ioDispatcher: CoroutineDispatcher,
     connectionFactory: PeerConnectionFactory,
@@ -83,10 +86,18 @@ constructor(
 
     @VisibleForTesting
     internal val peerConnection: PeerConnection = executeBlockingOnRTCThread(rtcThreadToken) {
-        connectionFactory.createPeerConnection(
-            config,
-            pcObserver,
-        ) ?: throw IllegalStateException("peer connection creation failed?")
+        val verifier = sslCertificateVerifier
+        val pc = if (verifier != null) {
+            // SPKI-pinned path: deps overload, native receives the verifier.
+            val deps = PeerConnectionDependencies.builder(pcObserver)
+                .setSSLCertificateVerifier(verifier)
+                .createPeerConnectionDependencies()
+            connectionFactory.createPeerConnection(config, deps)
+        } else {
+            // Unchanged legacy path: no-deps overload, native receives verifier = null.
+            connectionFactory.createPeerConnection(config, pcObserver)
+        }
+        pc ?: throw IllegalStateException("peer connection creation failed?")
     }!!
     private val pendingCandidates = mutableListOf<IceCandidate>()
     private var restartingIce: Boolean = false
@@ -392,6 +403,7 @@ constructor(
             config: RTCConfiguration,
             pcObserver: PeerConnection.Observer,
             listener: Listener?,
+            sslCertificateVerifier: SSLCertificateVerifier?,
         ): PeerConnectionTransport
     }
 }

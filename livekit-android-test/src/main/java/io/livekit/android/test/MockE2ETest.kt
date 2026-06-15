@@ -19,6 +19,7 @@ package io.livekit.android.test
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import com.google.protobuf.MessageLite
+import io.livekit.android.ConnectOptions
 import io.livekit.android.room.Room
 import io.livekit.android.test.mock.MockPeerConnection
 import io.livekit.android.test.mock.MockWebSocketFactory
@@ -72,16 +73,23 @@ abstract class MockE2ETest : BaseTest() {
         room.release()
     }
 
-    open suspend fun connect(joinResponse: LivekitRtc.SignalResponse = TestData.JOIN) {
-        connectSignal(joinResponse)
+    open suspend fun connect(
+        joinResponse: LivekitRtc.SignalResponse = TestData.JOIN,
+        connectOptions: ConnectOptions = ConnectOptions(),
+    ) {
+        connectSignal(joinResponse, connectOptions)
         connectPeerConnection()
     }
 
-    suspend fun connectSignal(joinResponse: LivekitRtc.SignalResponse = TestData.JOIN) {
+    suspend fun connectSignal(
+        joinResponse: LivekitRtc.SignalResponse = TestData.JOIN,
+        connectOptions: ConnectOptions = ConnectOptions(),
+    ) {
         val job = coroutineRule.scope.launch {
             room.connect(
                 url = TestData.EXAMPLE_URL,
                 token = "token",
+                options = connectOptions,
             )
         }
         prepareSignal(joinResponse)

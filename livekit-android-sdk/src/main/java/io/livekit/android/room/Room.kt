@@ -254,11 +254,11 @@ constructor(
      * Whether to collect WebRTC stats every second and publish them as
      * metrics data packets through the reliable data channel.
      *
-     * Defaults to `false`. Set to `true` before calling [connect] to enable.
+     * Defaults to `true`. Set to `false` before calling [connect] to disable.
      *
      * The LiveKit server only forwards these metrics to other room participants
      * (echoing back to the sender too) and does not persist them or surface them
-     * through any other channel, so leave this disabled unless your app actually
+     * through any other channel, so disable this unless your app actually
      * consumes [RoomEvent.MetricsReceived] (or the equivalent track stats APIs).
      *
      * Enabling this starts a 1Hz coroutine per direction (publisher/subscriber)
@@ -267,7 +267,7 @@ constructor(
      * reconnect this can amplify contention on those threads, so prefer leaving
      * it off in production unless metrics are explicitly required.
      */
-    var enableMetrics: Boolean = false
+    var enableMetrics: Boolean = true
 
     /**
      *  end-to-end encryption manager

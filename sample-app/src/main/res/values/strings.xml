@@ -9,6 +9,7 @@
     <string name="quic_device_type_str">QUIC Device Type</string>
     <string name="quic_cid_tag_str">QUIC CID Tag</string>
     <string name="url">URL</string>
+    <string name="rtc_proxy_str">RTC Proxy (TURN relay)</string>
     <string name="save_values">Save Values</string>
     <string name="reset_values">Reset Values</string>
     <string name="denoise_open">NS Open</string>

@@ -25,6 +25,7 @@ import io.livekit.android.test.mock.TestData
 import io.livekit.android.util.flow
 import junit.framework.Assert.assertEquals
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import livekit.org.webrtc.PeerConnection
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -141,6 +142,34 @@ class RoomReconnectionTypesMockE2ETest(
         // Wait so that the reconnect job properly starts first.
         testScheduler.advanceTimeBy(1000)
         reconnectWebsocket()
+        connectPeerConnection()
+
+        testScheduler.advanceUntilIdle()
+        val events = eventCollector.stopCollecting()
+        val states = stateCollector.stopCollecting()
+
+        assertIsClassList(
+            expectedEventsForReconnectType(reconnectType),
+            events,
+        )
+
+        assertEquals(
+            expectedStatesForReconnectType(reconnectType),
+            states,
+        )
+    }
+
+    @Test
+    fun reconnectIgnoresDelayedPeerConnectionDisconnect() = runTest {
+        connect()
+
+        val eventCollector = EventCollector(room.events, coroutineRule.scope)
+        val stateCollector = FlowCollector(room::state.flow, coroutineRule.scope)
+        disconnectPeerConnection()
+        // Wait so that the reconnect job properly starts first.
+        testScheduler.advanceTimeBy(1000)
+        reconnectWebsocket()
+        getSubscriberPeerConnection().moveToIceConnectionState(PeerConnection.IceConnectionState.FAILED)
         connectPeerConnection()
 
         testScheduler.advanceUntilIdle()

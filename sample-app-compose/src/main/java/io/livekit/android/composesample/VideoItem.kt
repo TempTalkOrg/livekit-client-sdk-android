@@ -17,6 +17,9 @@
 package io.livekit.android.composesample
 
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.material.Icon
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -29,6 +32,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.unit.dp
 import io.livekit.android.composesample.ui.VideoRenderer
 import io.livekit.android.room.Room
 import io.livekit.android.room.participant.Participant
@@ -52,20 +56,24 @@ fun VideoItemTrackSelector(
     val videoPubs = videoTrackMap.filter { (pub) -> pub.subscribed }
         .map { (pub) -> pub }
 
-    // Find the most appropriate video stream to show
-    // Prioritize screen share, then camera, then any video stream.
-    val videoPub = videoPubs.firstOrNull { pub -> pub.source == Track.Source.SCREEN_SHARE }
-        ?: videoPubs.firstOrNull { pub -> pub.source == Track.Source.CAMERA }
-        ?: videoPubs.firstOrNull()
+    val screenSharePub = videoPubs.firstOrNull { pub -> pub.source == Track.Source.SCREEN_SHARE }
+    val cameraPub = videoPubs.firstOrNull { pub -> pub.source == Track.Source.CAMERA }
+    val fallbackPub = videoPubs.firstOrNull()
+    val mainVideoPub = screenSharePub ?: cameraPub ?: fallbackPub
 
-    val videoTrack = videoPub?.track as? VideoTrack
+    val videoTrack = mainVideoPub?.track as? VideoTrack
+    val cameraTrack = if (screenSharePub != null) {
+        cameraPub?.track as? VideoTrack
+    } else {
+        null
+    }
     var videoMuted by remember { mutableStateOf(false) }
     var cameraFacingFront by remember { mutableStateOf(false) }
 
     // monitor muted state
-    LaunchedEffect(videoPub) {
-        if (videoPub != null) {
-            videoPub::muted.flow.collect { muted -> videoMuted = muted }
+    LaunchedEffect(mainVideoPub) {
+        if (mainVideoPub != null) {
+            mainVideoPub::muted.flow.collect { muted -> videoMuted = muted }
         }
     }
 
@@ -78,20 +86,32 @@ fun VideoItemTrackSelector(
         }
     }
 
-    if (videoTrack != null && !videoMuted) {
-        VideoRenderer(
-            room = room,
-            videoTrack = videoTrack,
-            mirror = room.localParticipant == participant && cameraFacingFront,
-            modifier = modifier,
-        )
-    } else {
-        Box(modifier = modifier) {
+    Box(modifier = modifier) {
+        if (videoTrack != null && (!videoMuted || mainVideoPub?.source == Track.Source.CAMERA)) {
+            VideoRenderer(
+                room = room,
+                videoTrack = videoTrack,
+                mirror = room.localParticipant == participant && cameraFacingFront,
+                modifier = Modifier.fillMaxSize(),
+            )
+        } else {
             Icon(
                 painter = painterResource(id = R.drawable.outline_videocam_off_24),
                 contentDescription = null,
                 tint = Color.White,
                 modifier = Modifier.align(Alignment.Center),
+            )
+        }
+
+        if (cameraTrack != null) {
+            VideoRenderer(
+                room = room,
+                videoTrack = cameraTrack,
+                mirror = room.localParticipant == participant && cameraFacingFront,
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(8.dp)
+                    .size(96.dp),
             )
         }
     }

@@ -322,12 +322,14 @@ internal constructor(
                     rtcConfig,
                     newPublisherObserver,
                     newPublisherObserver,
+                    connectOptions.sslCertificateVerifier,
                 )
                 subscriber?.close()
                 val newSubscriber = pctFactory.create(
                     rtcConfig,
                     newSubscriberObserver,
                     null,
+                    connectOptions.sslCertificateVerifier,
                 )
                 publisher = newPublisher
                 subscriber = newSubscriber
@@ -341,7 +343,11 @@ internal constructor(
                     if (newState.isConnected()) {
                         connectionState = ConnectionState.CONNECTED
                     } else if (newState.isDisconnected()) {
-                        connectionState = ConnectionState.DISCONNECTED
+                        if (connectionState == ConnectionState.RECONNECTING || connectionState == ConnectionState.RESUMING) {
+                            LKLog.d { "[$tagL, $tag] ignoring disconnected state while $connectionState" }
+                        } else {
+                            connectionState = ConnectionState.DISCONNECTED
+                        }
                     }
                 }
 
