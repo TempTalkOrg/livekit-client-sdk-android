@@ -95,6 +95,16 @@ internal constructor(
         flow.value = value
         onSetValue?.invoke(value, oldValue)
     }
+
+    /**
+     * Updates the backing [StateFlow] without invoking [onSetValue].
+     *
+     * Used during teardown so we can clear observable state without re-entering
+     * side effects such as native audio-processor rebinding.
+     */
+    fun setValueSilently(value: T) {
+        flow.value = value
+    }
 }
 
 /**

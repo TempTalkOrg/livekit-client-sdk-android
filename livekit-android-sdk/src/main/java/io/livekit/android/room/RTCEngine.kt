@@ -145,7 +145,11 @@ internal constructor(
 
             ConnectionState.DISCONNECTED -> {
                 LKLog.d { "primary ICE disconnected" }
-                if (oldVal == ConnectionState.CONNECTED) {
+                // An intentional teardown (close()/disconnect()) also drives the ICE
+                // state to DISCONNECTED. That is not a connection loss and must not
+                // request a reconnect. close() sets isClosed=true before it flips
+                // connectionState, so this guard reliably distinguishes the two.
+                if (oldVal == ConnectionState.CONNECTED && !isClosed) {
                     listener?.onEngineConnectionLost("primary ICE disconnected")
                 }
             }
@@ -212,6 +216,26 @@ internal constructor(
     @Volatile
     private var isClosed = true
 
+    /**
+     * Monotonically increasing id bumped once per fresh connection session started
+     * via [join]. It is used to drop stale disconnect callbacks that belong to a
+     * previous session.
+     *
+     * Concretely: on a manual server switch the app does `disconnect()` (old node)
+     * immediately followed by `connect()` (new node). The old session's server
+     * `leave` response can arrive asynchronously and reach [onLeave] while the new
+     * session is already being established. Since [close] performs a blocking RTC
+     * thread teardown, the resulting [Listener.onEngineDisconnected] can fire after
+     * the new [join] has begun and would otherwise tear the new session down.
+     * Comparing the generation captured when the leave was received against the
+     * current one lets us discard such stale disconnects.
+     *
+     * Internal reconnects deliberately go through [joinImpl] and keep the same
+     * generation, so a disconnect during an in-session reconnect is still honored.
+     */
+    @Volatile
+    private var sessionGeneration = 0L
+
     @Volatile
     private var hasPublished = false
 
@@ -251,6 +275,9 @@ internal constructor(
         options: ConnectOptions,
         roomOptions: RoomOptions,
     ): JoinResponse {
+        // Mark the start of a new session so that any stale disconnect callback from
+        // the previous session (e.g. a late server `leave` response) can be discarded.
+        sessionGeneration++
         coroutineScope.close()
         coroutineScope = CloseableCoroutineScope(SupervisorJob() + ioDispatcher)
         sessionUrl = url
@@ -1233,6 +1260,13 @@ internal constructor(
         private val RELIABLE_RECEIVE_STATE_TTL_MS = 30.seconds
         private val RELIABLE_RETRY_AMOUNT = (DATA_CHANNEL_LOW_THRESHOLD * 1.25).toLong()
 
+        // Server leave reasons that are recoverable by rejoining the room. When a leave with
+        // one of these reasons arrives with a DISCONNECT action, the client forces a full
+        // reconnect instead of ending the call.
+        private val RECOVERABLE_LEAVE_REASONS = setOf(
+            LivekitModels.DisconnectReason.STATE_MISMATCH,
+        )
+
         internal val CONN_CONSTRAINTS = MediaConstraints().apply {
             with(optional) {
                 add(MediaConstraints.KeyValuePair("DtlsSrtpKeyAgreement", "true"))
@@ -1378,6 +1412,11 @@ internal constructor(
     override fun onLeave(leave: LeaveRequest) {
         LKLog.d { "leave request received: reason = ${leave.reason.name}, action = ${leave.action.name}" }
 
+        // Capture the session this leave belongs to. If a new session starts while we
+        // tear the old one down below (close() blocks on the RTC thread), the resulting
+        // disconnect must not be propagated against the new session.
+        val disconnectGeneration = sessionGeneration
+
         abortPendingPublishTracks()
 
         if (leave.hasRegions()) {
@@ -1405,8 +1444,32 @@ internal constructor(
                 }
             }
 
+            // Some servers send a DISCONNECT action with a recoverable reason (e.g.
+            // STATE_MISMATCH after a resume the server considers stale). This is
+            // recoverable by rejoining, so force a full reconnect instead of tearing
+            // down the call.
+            leave.reason in RECOVERABLE_LEAVE_REASONS -> {
+                LKLog.i {
+                    "leave action=${leave.action.name} reason=${leave.reason.name} is recoverable, " +
+                        "forcing full reconnect instead of disconnect"
+                }
+                fullReconnectOnNext = true
+                coroutineScope.launch {
+                    yield()
+                    reconnect(reason = "server leave action=${leave.action.name} reason=${leave.reason.name}")
+                }
+            }
+
             else -> {
                 close()
+                if (sessionGeneration != disconnectGeneration) {
+                    LKLog.w {
+                        "leave/disconnect superseded by a newer session " +
+                            "(gen $disconnectGeneration -> $sessionGeneration), " +
+                            "skipping onEngineDisconnected to keep the current session"
+                    }
+                    return
+                }
                 val disconnectReason = leave.reason.convert()
                 listener?.onEngineDisconnected(disconnectReason)
             }

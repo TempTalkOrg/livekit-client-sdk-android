@@ -43,12 +43,22 @@ import io.livekit.android.sample.dialog.showDebugMenuDialog
 import io.livekit.android.sample.dialog.showSelectAudioDeviceDialog
 import io.livekit.android.sample.model.StressTest
 import io.livekit.android.sample.proxy.ProxyConfig
+import io.livekit.android.util.LKLog
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.parcelize.Parcelize
 
 class CallActivity : AppCompatActivity() {
-    private val denoiser: AudioPipelineProcessor by lazy { AudioPipelineProcessor(context = applicationContext, debugLog = true) }
+    private val denoiserDelegate = lazy {
+        AudioPipelineProcessor(context = applicationContext, debugLog = true).also { processor ->
+            LKLog.i {
+                "[AudioProcessorLifecycle] demo processor created " +
+                    "activity=${System.identityHashCode(this)} " +
+                    "processor=${System.identityHashCode(processor)}"
+            }
+        }
+    }
+    private val denoiser: AudioPipelineProcessor by denoiserDelegate
     private var currentDfConfig = DeepFilterConfig()
     private var vcEnabled = false
     private var selectedPreset: String? = null
@@ -392,11 +402,32 @@ class CallActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        val activityId = System.identityHashCode(this)
+        LKLog.i {
+            "[AudioProcessorLifecycle] demo onDestroy begin " +
+                "activity=$activityId processorInitialized=${denoiserDelegate.isInitialized()}"
+        }
         binding.audienceRow.adapter = null
         binding.speakerView.adapter = null
         super.onDestroy()
 
-        denoiser.release()
+        if (denoiserDelegate.isInitialized()) {
+            val processorId = System.identityHashCode(denoiser)
+            LKLog.i {
+                "[AudioProcessorLifecycle] demo processor release begin " +
+                    "activity=$activityId processor=$processorId"
+            }
+            denoiser.release()
+            LKLog.i {
+                "[AudioProcessorLifecycle] demo processor release complete " +
+                    "activity=$activityId processor=$processorId"
+            }
+        } else {
+            LKLog.i {
+                "[AudioProcessorLifecycle] demo processor release skipped " +
+                    "activity=$activityId reason=not_initialized"
+            }
+        }
     }
 
     companion object {

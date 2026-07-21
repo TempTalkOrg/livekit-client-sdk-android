@@ -50,8 +50,14 @@ class WebSocketTransport(
 
         val client = configureClient(options)
 
+        // When self-signed cert verification is in use with a direct-IP URL,
+        // rewrite the host to the real serverHost domain so the TLS handshake
+        // can validate against the server certificate. Covers both the direct
+        // WebSocket reconnect path and the QUIC->WebSocket fallback path.
+        val connectUrl = WebSocketUrlRewriter.rewriteIpUrlForWebSocket(url, options)
+
         val requestBuilder = Request.Builder()
-            .url(url)
+            .url(connectUrl)
             .addHeader("Authorization", "Bearer $token")
 
         options.userAgent?.let {

@@ -81,9 +81,11 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
@@ -107,8 +109,16 @@ import livekit.org.webrtc.audio.AudioDeviceModule
 import java.net.URI
 import java.util.Date
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Named
 import kotlin.time.Duration
+
+/**
+ * How long to keep a remote participant locally after a non client-initiated
+ * disconnect (e.g. a network drop), giving them a chance to reconnect before we
+ * actually remove them and emit [RoomEvent.ParticipantDisconnected].
+ */
+private const val DELAYED_PARTICIPANT_REMOVE_TIMEOUT_MS = 40_000L
 
 class Room
 @AssistedInject
@@ -372,6 +382,14 @@ constructor(
         get() = engine.serverInfo
 
     private var sidToIdentity = mutableMapOf<Participant.Sid, Participant.Identity>()
+
+    /**
+     * Pending delayed removals for remote participants that disconnected for a
+     * reason other than [LivekitModels.DisconnectReason.CLIENT_INITIATED]. Keyed
+     * by identity so the timer can be cancelled if the participant reconnects
+     * within the grace period.
+     */
+    private val pendingParticipantRemovals = ConcurrentHashMap<Participant.Identity, Job>()
 
     private var mutableActiveSpeakers by flowDelegate(emptyList<Participant>())
 
@@ -738,6 +756,20 @@ constructor(
         localParticipant.updateFromInfo(response.participant)
         localParticipant.setEnabledPublishCodecs(response.enabledPublishCodecsList)
 
+        // Reconcile the remote roster against the (re)join response. On a full reconnect the remote
+        // roster is kept (onFullReconnecting does not disconnect remotes), so anyone who left while
+        // we were disconnected is absent from otherParticipants and would otherwise linger as a
+        // ghost. Remove them immediately: the (re)join response is the authoritative current roster,
+        // so an absent participant has already left — unlike a mid-call network drop, there is no
+        // "might reconnect" window to wait for (the 40s grace path would keep the ghost far too
+        // long). On a fresh connect the roster is empty, so this is a no-op.
+        val joinedIdentities = response.otherParticipantsList
+            .map { Participant.Identity(it.identity) }
+            .toSet()
+        remoteParticipants.keys
+            .filter { it !in joinedIdentities }
+            .forEach { handleParticipantDisconnect(it) }
+
         if (response.otherParticipantsList.isNotEmpty()) {
             response.otherParticipantsList.forEach { info ->
                 getOrCreateRemoteParticipant(Participant.Identity(info.identity), info)
@@ -832,6 +864,9 @@ constructor(
     }
 
     private fun handleParticipantDisconnect(identity: Participant.Identity) {
+        // Any pending delayed removal for this identity is now moot.
+        cancelPendingParticipantRemoval(identity)
+
         val newParticipants = mutableRemoteParticipants.toMutableMap()
         val newActiveSpeakers = mutableActiveSpeakers.toMutableList()
         val removedParticipant = newParticipants.remove(identity) ?: return
@@ -845,6 +880,42 @@ constructor(
         eventBus.postEvent(RoomEvent.ParticipantDisconnected(this, removedParticipant), coroutineScope)
 
         localParticipant.handleParticipantDisconnect(identity)
+    }
+
+    /**
+     * Schedules a delayed removal of a remote participant that disconnected for a
+     * non client-initiated reason. If a removal is already pending for this
+     * identity, the existing timer is kept.
+     */
+    private fun scheduleParticipantRemoval(identity: Participant.Identity) {
+        if (pendingParticipantRemovals.containsKey(identity)) {
+            return
+        }
+        LKLog.i { "delaying removal of remote participant $identity by ${DELAYED_PARTICIPANT_REMOVE_TIMEOUT_MS}ms (waiting for possible reconnect)" }
+        val job = coroutineScope.launch {
+            delay(DELAYED_PARTICIPANT_REMOVE_TIMEOUT_MS)
+            pendingParticipantRemovals.remove(identity)
+            LKLog.i { "remote participant $identity did not reconnect within grace period, removing" }
+            handleParticipantDisconnect(identity)
+        }
+        pendingParticipantRemovals[identity] = job
+    }
+
+    /** Cancels a pending delayed removal for the given participant identity, if any. */
+    private fun cancelPendingParticipantRemoval(identity: Participant.Identity) {
+        val job = pendingParticipantRemovals.remove(identity) ?: return
+        LKLog.i { "remote participant $identity reconnected within grace period, cancelling delayed removal" }
+        job.cancel()
+    }
+
+    /** Cancels all pending delayed participant removals (e.g. on disconnect/reconnect). */
+    private fun cancelAllPendingParticipantRemovals() {
+        if (pendingParticipantRemovals.isEmpty()) {
+            return
+        }
+        LKLog.d { "cancelling ${pendingParticipantRemovals.size} pending participant removal(s)" }
+        pendingParticipantRemovals.values.toList().forEach { it.cancel() }
+        pendingParticipantRemovals.clear()
     }
 
     fun getParticipantBySid(sid: String): Participant? {
@@ -1094,6 +1165,7 @@ constructor(
         e2eeManager?.dispose()
         e2eeManager = null
         localParticipant.cleanup()
+        cancelAllPendingParticipantRemovals()
         remoteParticipants.keys.toMutableSet() // copy keys to avoid concurrent modifications.
             .forEach { sid -> handleParticipantDisconnect(sid) }
 
@@ -1281,6 +1353,10 @@ constructor(
      * @suppress
      */
     override fun onEngineReconnecting() {
+        // while the local connection is unstable we won't receive remote reconnect
+        // updates, so suspend any pending delayed participant removals to avoid
+        // wrongly removing still-present peers during a soft reconnect.
+        cancelAllPendingParticipantRemovals()
         state = State.RECONNECTING
         eventBus.postEvent(RoomEvent.Reconnecting(this), coroutineScope)
     }
@@ -1378,8 +1454,21 @@ constructor(
             val isNewParticipant = !remoteParticipants.contains(participantIdentity)
 
             if (info.state == LivekitModels.ParticipantInfo.State.DISCONNECTED) {
-                handleParticipantDisconnect(participantIdentity)
+                LKLog.i { "remote participant $participantIdentity disconnected, reason: ${info.disconnectReason}" }
+                if (info.disconnectReason == LivekitModels.DisconnectReason.CLIENT_INITIATED) {
+                    // the participant left on purpose, remove it immediately
+                    cancelPendingParticipantRemoval(participantIdentity)
+                    handleParticipantDisconnect(participantIdentity)
+                } else {
+                    // the participant may be reconnecting (e.g. network drop). Keep it
+                    // locally for a grace period so the local user doesn't see them leave,
+                    // and only remove it once the window elapses without a reconnect.
+                    scheduleParticipantRemoval(participantIdentity)
+                }
             } else {
+                // an active update means the participant is (still) present. If a delayed
+                // removal was pending (e.g. they reconnected after a drop), cancel it.
+                cancelPendingParticipantRemoval(participantIdentity)
                 val participant = getOrCreateRemoteParticipant(participantIdentity, info)
                 if (isNewParticipant) {
                     eventBus.postEvent(RoomEvent.ParticipantConnected(this, participant), coroutineScope)
@@ -1589,6 +1678,10 @@ constructor(
      */
     override fun onFullReconnecting() {
         localParticipant.prepareForFullReconnect()
+
+        // any pending delayed participant removals are no longer meaningful during a
+        // full reconnect; the roster will be rebuilt from fresh participant updates
+        cancelAllPendingParticipantRemovals()
 
         // disable all remote participants, to avoid ParticipantDisconnect events
         /*

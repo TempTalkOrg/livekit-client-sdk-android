@@ -464,8 +464,10 @@ internal object RTCModule {
         webrtcInitialization: LibWebrtcInitialization,
         @Named(InjectionNames.OVERRIDE_AUDIO_PROCESSOR_OPTIONS)
         audioProcessorOptions: AudioProcessorOptions?,
+        closeableManager: CloseableManager,
     ): CustomAudioProcessingFactory {
         return CustomAudioProcessingFactory(audioProcessorOptions ?: AudioProcessorOptions())
+            .apply { closeableManager.registerClosable(this) }
     }
 
     @Provides

@@ -1,5 +1,5 @@
 /*
- * Copyright 2023-2025 LiveKit, Inc.
+ * Copyright 2023-2026 LiveKit, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -39,6 +39,7 @@ import io.livekit.android.webrtc.peerconnection.RTCThreadToken
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
@@ -76,8 +77,9 @@ constructor(
     rtcThreadToken: RTCThreadToken,
 ) : AudioTrack(name, mediaTrack, rtcThreadToken) {
     /**
-     * To only be used for flow delegate scoping, and should not be cancelled.
-     **/
+     * Scopes Flow-derived properties such as [features]. Cancelled from [dispose]
+     * so Eagerly-started collectors do not retain the audio processing controller.
+     */
     private val delegateScope = CoroutineScope(dispatcher + SupervisorJob())
 
     internal var transceiver: RtpTransceiver? = null
@@ -175,6 +177,7 @@ constructor(
             }
             trackSinks.clear()
         }
+        delegateScope.cancel()
         super.dispose()
     }
 

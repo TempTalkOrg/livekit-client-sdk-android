@@ -64,6 +64,9 @@ dependencies {
     implementation libs.groupie
     implementation libs.groupie.viewbinding
     testImplementation libs.junit
+    testImplementation libs.coroutines.test
+    testImplementation libs.mockito.kotlin
+    testImplementation libs.mockito.inline
     androidTestImplementation libs.androidx.test.junit
     androidTestImplementation libs.espresso
 }

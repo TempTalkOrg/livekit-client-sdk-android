@@ -53,13 +53,40 @@ class ParticipantItem(
     private var boundMainVideoTrack: VideoTrack? = null
     private var boundCameraVideoTrack: VideoTrack? = null
     private var coroutineScope: CoroutineScope? = null
+    private var initializedBinding: ParticipantItemBinding? = null
 
     override fun initializeViewBinding(view: View): ParticipantItemBinding {
-        val binding = ParticipantItemBinding.bind(view)
-        room.initVideoRenderer(binding.renderer)
-        room.initVideoRenderer(binding.cameraRenderer)
+        return ParticipantItemBinding.bind(view)
+    }
 
-        return binding
+    internal fun initializeRenderers(viewBinding: ParticipantItemBinding) {
+        if (initializedBinding === viewBinding) {
+            return
+        }
+        initializedBinding?.let(::teardownRenderers)
+        room.initVideoRenderer(viewBinding.renderer)
+        room.initVideoRenderer(viewBinding.cameraRenderer)
+        initializedBinding = viewBinding
+    }
+
+    internal fun releaseRenderers(viewBinding: ParticipantItemBinding) {
+        if (initializedBinding !== viewBinding) {
+            return
+        }
+        viewBinding.renderer.release()
+        viewBinding.cameraRenderer.release()
+        initializedBinding = null
+    }
+
+    private fun teardownRenderers(viewBinding: ParticipantItemBinding) {
+        if (initializedBinding !== viewBinding) {
+            return
+        }
+        boundMainVideoTrack?.removeRenderer(viewBinding.renderer)
+        boundCameraVideoTrack?.removeRenderer(viewBinding.cameraRenderer)
+        boundMainVideoTrack = null
+        boundCameraVideoTrack = null
+        releaseRenderers(viewBinding)
     }
 
     private fun ensureCoroutineScope() {
@@ -69,6 +96,7 @@ class ParticipantItem(
     }
 
     override fun bind(viewBinding: ParticipantItemBinding, position: Int) {
+        initializeRenderers(viewBinding)
         ensureCoroutineScope()
         coroutineScope?.launch {
             participant::identity.flow.collect { identity ->
@@ -202,11 +230,8 @@ class ParticipantItem(
     override fun unbind(viewHolder: GroupieViewHolder<ParticipantItemBinding>) {
         coroutineScope?.cancel()
         coroutineScope = null
+        teardownRenderers(viewHolder.binding)
         super.unbind(viewHolder)
-        boundMainVideoTrack?.removeRenderer(viewHolder.binding.renderer)
-        boundCameraVideoTrack?.removeRenderer(viewHolder.binding.cameraRenderer)
-        boundMainVideoTrack = null
-        boundCameraVideoTrack = null
     }
 
     override fun getLayout(): Int =
