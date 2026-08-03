@@ -1,1 +1,4 @@
 /build
+
+# Superseded by build/nativeJniLibs, which buildNativeLibs regenerates on every build
+/src/main/jniLibs

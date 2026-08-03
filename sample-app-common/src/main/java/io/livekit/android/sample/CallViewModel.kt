@@ -208,6 +208,7 @@ class CallViewModel(
             timestamp = param.startCall.timestamp
             conversationId = param.startCall.conversationId
             publicKey = param.startCall.publicKey
+            clientCallId = room.localId
             addAllCipherMessages(cipherMessages)
             addAllEncInfos(encInfos)
             this.notification = notification

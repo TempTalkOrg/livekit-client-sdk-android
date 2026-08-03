@@ -182,8 +182,15 @@ constructor(
                 .setSessionId(AudioManager.AUDIO_SESSION_ID_GENERATE)
                 .build()
                 .apply {
-                    write(audioSample, audioSample.remaining(), AudioTrack.WRITE_BLOCKING)
-                    setLoopPoints(0, AUDIO_FRAME_PER_BUFFER - 1, -1)
+                    val bytesWritten = write(audioSample, audioSample.remaining(), AudioTrack.WRITE_BLOCKING)
+                    val framesWritten = bytesWritten / getBytesPerSample(AUDIO_FORMAT)
+                    // The loop end is a frame index into the static buffer, so it has to follow the
+                    // frames actually written. framesPerBuffer is device dependent and is below 160
+                    // on some devices (128 on a Pixel 6), where a fixed loop end is rejected and the
+                    // track falls silent after a single pass.
+                    if (framesWritten <= 0 || setLoopPoints(0, framesWritten - 1, -1) != AudioTrack.SUCCESS) {
+                        LKLog.w { "Failed to loop audio track for communication workaround, bytesWritten: $bytesWritten" }
+                    }
                 }
         } catch (e: Exception) {
             LKLog.w(e) { "Failed to build audio track for communication workaround." }
@@ -243,8 +250,10 @@ constructor(
     }
 
     companion object {
-        private const val SAMPLE_RATE = 16000
         private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
-        private const val AUDIO_FRAME_PER_BUFFER = SAMPLE_RATE / 100 // 10 ms
+
+        // Only used as fallbacks when the device doesn't report its output properties.
+        private const val SAMPLE_RATE = 16000
+        private const val AUDIO_FRAME_PER_BUFFER = SAMPLE_RATE / 100 // 10 ms at SAMPLE_RATE
     }
 }
