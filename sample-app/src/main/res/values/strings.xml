@@ -6,6 +6,7 @@
     <string name="e2ee_key_str">E2EE Key</string>
     <string name="e2ee_enabled_str">Enable E2EE</string>
     <string name="quic_enabled_str">Enable Quic Signal</string>
+    <string name="quic_connect_timeout_ms_str">QUIC Connect Timeout (ms)</string>
     <string name="quic_device_type_str">QUIC Device Type</string>
     <string name="quic_cid_tag_str">QUIC CID Tag</string>
     <string name="url">URL</string>
@@ -27,4 +28,5 @@
     <string name="vc_preset_original">Original\n0</string>
     <string name="vc_preset_uncle">Uncle\n-7</string>
     <string name="vc_preset_monster">Monster\n-12</string>
+    <string name="media_send_issue">对方可能听不到你，正在恢复…</string>
 </resources>

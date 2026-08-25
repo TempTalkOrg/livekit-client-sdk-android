@@ -16,6 +16,7 @@
 
 package io.livekit.android
 
+import io.livekit.android.room.ClientProtocolVersion
 import io.livekit.android.room.ProtocolVersion
 import io.livekit.android.room.Room
 import livekit.LivekitTemptalk
@@ -160,6 +161,20 @@ data class ConnectOptions(
      * DTLS-SRTP end-to-end; this only hardens the TURN transport-camouflage TLS.
      */
     val sslCertificateVerifier: SSLCertificateVerifier? = null,
+    /**
+     * The client protocol version to advertise to other participants in the room
+     * for peer-to-peer feature negotiation (RPC v2, etc.). Defaults to the latest
+     * version supported by this SDK build.
+     */
+    val clientProtocol: ClientProtocolVersion = ClientProtocolVersion.DATA_STREAM_RPC,
+
+    /**
+     * Initial QUIC signaling connect timeout in milliseconds.
+     *
+     * Valid values are from 1000 through 15000. Invalid values use 7000.
+     * Only used when [useQuicSignal] is true.
+     */
+    val quicConnectTimeoutMs: Int = 7000,
 ) {
     internal var reconnect: Boolean = false
     internal var participantSid: String? = null

@@ -104,7 +104,7 @@ constructor(
 
     private var renegotiate = false
 
-    private var trackBitrates = mutableMapOf<TrackBitrateInfoKey, TrackBitrateInfo>()
+    private val trackBitrates = mutableMapOf<TrackBitrateInfoKey, TrackBitrateInfo>()
     private var isClosed = AtomicBoolean(false)
 
     private val latestOfferId = AtomicInteger(0)

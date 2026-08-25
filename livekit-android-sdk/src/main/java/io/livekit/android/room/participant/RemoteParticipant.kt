@@ -211,6 +211,7 @@ class RemoteParticipant(
 
         val track = publication.track
         if (track != null) {
+            @Suppress("SwallowedException")
             try {
                 track.stop()
             } catch (e: Exception) {
@@ -236,6 +237,27 @@ class RemoteParticipant(
                 ParticipantEvent.TrackSubscriptionPermissionChanged(this, pub, pub.subscriptionAllowed),
                 coroutineScope,
             )
+        }
+    }
+
+    internal fun onSubscriptionError(subscriptionResponse: LivekitRtc.SubscriptionResponse) {
+        val trackSid = subscriptionResponse.trackSid
+        if (trackPublications[trackSid] !is RemoteTrackPublication) {
+            return
+        }
+
+        val exception = subscriptionErrorException(subscriptionResponse.err)
+        internalListener?.onTrackSubscriptionFailed(trackSid, exception, this)
+        eventBus.postEvent(ParticipantEvent.TrackSubscriptionFailed(this, trackSid, exception), scope)
+    }
+
+    private fun subscriptionErrorException(error: LivekitModels.SubscriptionError): TrackException {
+        return when (error) {
+            LivekitModels.SubscriptionError.SE_CODEC_UNSUPPORTED -> TrackException.MediaException("Codec not supported")
+            LivekitModels.SubscriptionError.SE_TRACK_NOTFOUND -> TrackException.InvalidTrackStateException("Track not found")
+            LivekitModels.SubscriptionError.SE_UNKNOWN,
+            LivekitModels.SubscriptionError.UNRECOGNIZED,
+            -> TrackException.InvalidTrackStateException("Subscription failed")
         }
     }
 

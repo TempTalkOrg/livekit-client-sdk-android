@@ -273,8 +273,9 @@ internal object RTCModule {
                 LKLog.log(loggingLevel, null) {
                     LKLog.withExternalPrefix { "[quic] $messageFormatted" }
                 }
-            } catch (t: Throwable) {
-                // do nothing
+            } catch (_: Throwable) {
+                // Swallowed deliberately: this runs on a native QUIC callback, where
+                // throwing would take down the connection over a mere logging failure.
             }
         }
         return Connector(config)
@@ -411,10 +412,17 @@ internal object RTCModule {
     }
 
     @Provides
-    fun audioPrewarmer(audioDeviceModule: AudioDeviceModule): AudioRecordPrewarmer {
-        return if (audioDeviceModule is JavaAudioDeviceModule) {
+    fun audioPrewarmer(
+        @Named(InjectionNames.OVERRIDE_DISABLE_AUDIO_PREWARM)
+        disableAudioPrewarm: Boolean,
+        audioDeviceModule: AudioDeviceModule,
+    ): AudioRecordPrewarmer {
+        return if (disableAudioPrewarm) {
+            NoAudioRecordPrewarmer()
+        } else if (audioDeviceModule is JavaAudioDeviceModule) {
             JavaAudioRecordPrewarmer(audioDeviceModule)
         } else {
+            LKLog.w { "Custom audio device module detected. Audio record prewarming is not available." }
             NoAudioRecordPrewarmer()
         }
     }
@@ -569,7 +577,7 @@ internal object RTCModule {
     fun videoHwAccel() = true
 
     @Provides
-    fun sdpFactory() = SdpFactory.getInstance()
+    fun sdpFactory(): SdpFactory = SdpFactory.getInstance()
 }
 
 /**

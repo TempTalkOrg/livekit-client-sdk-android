@@ -30,7 +30,10 @@ import io.livekit.android.test.util.toPBByteString
 import io.livekit.android.util.toOkioByteString
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
+import kotlinx.coroutines.supervisorScope
+import kotlinx.coroutines.yield
 import kotlinx.serialization.json.Json
+import livekit.LivekitModels
 import livekit.LivekitRtc
 import livekit.org.webrtc.SessionDescription
 import okhttp3.OkHttpClient
@@ -45,9 +48,11 @@ import org.junit.Before
 import org.junit.Test
 import org.mockito.Mock
 import org.mockito.Mockito
+import org.mockito.Mockito.clearInvocations
 import org.mockito.Mockito.inOrder
 import org.mockito.kotlin.any
 import org.mockito.kotlin.argThat
+import org.mockito.kotlin.never
 import org.mockito.kotlin.times
 
 @ExperimentalCoroutinesApi
@@ -147,7 +152,7 @@ class SignalClientTest : BaseTest() {
             }
         }
 
-        client.onFailure(wsFactory.ws, Exception(), null)
+        wsFactory.ws.cancel()
         job.await()
 
         assertTrue(failed)
@@ -196,10 +201,84 @@ class SignalClientTest : BaseTest() {
         connectWebsocketAndJoin()
         job.await()
 
-        client.onFailure(wsFactory.ws, Exception(), null)
+        wsFactory.ws.cancel()
 
         Mockito.verify(listener)
             .onClose(any(), any())
+    }
+
+    /**
+     * Cold [join] handshake failure: [isConnected] is still false and this is not a reconnect attempt,
+     * so the listener must not get [SignalClient.Listener.onClose] (RTCEngine uses [onError] while
+     * CONNECTING). OkHttp does not call [WebSocketListener.onClosed] after [WebSocketListener.onFailure].
+     */
+    @Test
+    fun onCloseNotInvokedWhenJoinHandshakeFailsBeforeJoinMessage() = runTest {
+        supervisorScope {
+            val job = async {
+                client.join(EXAMPLE_URL, "")
+            }
+            yield()
+            client.onOpen(wsFactory.ws, createOpenResponse(wsFactory.request))
+            wsFactory.ws.cancel()
+
+            runCatching { job.await() }
+        }
+
+        Mockito.verify(listener, never()).onClose(any(), any())
+        Mockito.verify(listener, times(1)).onError(any())
+    }
+
+    /**
+     * Mirrors [RTCEngine] soft reconnect, and then tests when the reconnect handshake fails before
+     * the reconnect message is delivered (no join response yet).
+     */
+    @Test
+    fun onCloseInvokedWhenReconnectHandshakeFailsBeforeReconnectMessage() = runTest {
+        val joinJob = async {
+            client.join(EXAMPLE_URL, "")
+        }
+        connectWebsocketAndJoin()
+        joinJob.await()
+
+        val connectedWs = wsFactory.ws
+        connectedWs.cancel()
+        Mockito.verify(listener).onClose(any(), any())
+
+        supervisorScope {
+            val reconnectJob = async {
+                client.reconnect(EXAMPLE_URL, "", "participant_sid")
+            }
+            yield()
+            clearInvocations(listener)
+
+            client.onOpen(wsFactory.ws, createOpenResponse(wsFactory.request))
+            wsFactory.ws.cancel()
+
+            runCatching { reconnectJob.await() }
+        }
+
+        Mockito.verify(listener).onClose(
+            argThat { reason: String -> reason.contains("cancelled") },
+            any(),
+        )
+    }
+
+    /**
+     * When the join coroutine is cancelled, [MockWebSocket.cancel] runs and delivers [onFailure].
+     * That path must not report a normal signal close to the listener (no duplicate reconnect churn).
+     */
+    @Test
+    fun onCloseNotInvokedWhenJoinJobCancelled() = runTest {
+        val job = async {
+            client.join(EXAMPLE_URL, "")
+        }
+        yield()
+        job.cancel()
+
+        runCatching { job.await() }
+
+        Mockito.verify(listener, never()).onClose(any(), any())
     }
 
     /**
@@ -350,6 +429,77 @@ class SignalClientTest : BaseTest() {
         testScheduler.advanceUntilIdle()
 
         assertTrue(originalWs.isClosed)
+    }
+
+    /**
+     * Reconnect fails cleanly when server sends LEAVE as the initial response and closes WS cleanly.
+     */
+    @Test
+    fun reconnectDoesNotHangOnLeaveStateMismatchWithCleanClose() = runTest {
+        val joinJob = async { client.join(EXAMPLE_URL, "") }
+        connectWebsocketAndJoin()
+        joinJob.await()
+
+        wsFactory.ws.cancel()
+
+        supervisorScope {
+            val reconnectJob = async {
+                client.reconnect(EXAMPLE_URL, "", "participant_sid")
+            }
+            yield()
+
+            client.onOpen(wsFactory.ws, createOpenResponse(wsFactory.request))
+            val leaveResponse = with(LivekitRtc.SignalResponse.newBuilder()) {
+                leave = with(LivekitRtc.LeaveRequest.newBuilder()) {
+                    reason = LivekitModels.DisconnectReason.STATE_MISMATCH
+                    action = LivekitRtc.LeaveRequest.Action.RECONNECT
+                    build()
+                }
+                build()
+            }
+            wsFactory.receiveMessage(leaveResponse)
+
+            wsFactory.ws.close(1000, "normal")
+
+            val result = runCatching { reconnectJob.await() }
+            assertTrue("reconnect should have failed", result.isFailure)
+        }
+    }
+
+    /**
+     * Reconnect fails cleanly when server sends LEAVE as the initial response and drops the connection.
+     */
+    @Test
+    fun reconnectDoesNotHangOnLeaveStateMismatchWithFailure() = runTest {
+        val joinJob = async { client.join(EXAMPLE_URL, "") }
+        connectWebsocketAndJoin()
+        joinJob.await()
+
+        wsFactory.ws.cancel()
+
+        supervisorScope {
+            val reconnectJob = async {
+                client.reconnect(EXAMPLE_URL, "", "participant_sid")
+            }
+            yield()
+
+            client.onOpen(wsFactory.ws, createOpenResponse(wsFactory.request))
+            val leaveResponse = with(LivekitRtc.SignalResponse.newBuilder()) {
+                leave = with(LivekitRtc.LeaveRequest.newBuilder()) {
+                    reason = LivekitModels.DisconnectReason.STATE_MISMATCH
+                    action = LivekitRtc.LeaveRequest.Action.RECONNECT
+                    build()
+                }
+                build()
+            }
+            wsFactory.receiveMessage(leaveResponse)
+
+            // 5. Server drops connection (unclean close)
+            wsFactory.ws.cancel()
+
+            val result = runCatching { reconnectJob.await() }
+            assertTrue("reconnect should have failed", result.isFailure)
+        }
     }
 
     // mock data

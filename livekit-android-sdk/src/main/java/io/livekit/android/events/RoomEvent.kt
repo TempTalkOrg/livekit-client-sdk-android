@@ -18,6 +18,7 @@ package io.livekit.android.events
 
 import io.livekit.android.annotations.Beta
 import io.livekit.android.e2ee.E2EEState
+import io.livekit.android.room.MediaSendConnectionState
 import io.livekit.android.room.Room
 import io.livekit.android.room.participant.ConnectionQuality
 import io.livekit.android.room.participant.LocalParticipant
@@ -38,6 +39,23 @@ sealed class RoomEvent(val room: Room) : Event() {
      * Connected to Room
      */
     class Connected(room: Room) : RoomEvent(room)
+
+    /**
+     * Local media send (uplink) health has updated.
+     *
+     * This is distinct from [Room.state] when `subscriberPrimary` is enabled:
+     * the room may remain [Room.State.CONNECTED] while local audio/video cannot be sent.
+     *
+     * UI tip: show room recovery for [MediaSendConnectionState.ROOM_RECOVERING],
+     * show a publisher-only warning for [MediaSendConnectionState.RECOVERING] or
+     * [MediaSendConnectionState.FAILED], and do not warn for normal
+     * [MediaSendConnectionState.CONNECTING] negotiation.
+     */
+    class MediaSendConnectionStateChanged(
+        room: Room,
+        val state: MediaSendConnectionState,
+        val oldState: MediaSendConnectionState,
+    ) : RoomEvent(room)
 
     /**
      * A network change has been detected and LiveKit attempts to reconnect to the room
@@ -331,6 +349,7 @@ fun LivekitModels.DisconnectReason?.convert(): DisconnectReason {
         LivekitModels.DisconnectReason.SIP_TRUNK_FAILURE -> DisconnectReason.SIP_TRUNK_FAILURE
         LivekitModels.DisconnectReason.CONNECTION_TIMEOUT -> DisconnectReason.CONNECTION_TIMEOUT
         LivekitModels.DisconnectReason.MEDIA_FAILURE -> DisconnectReason.MEDIA_FAILURE
+        LivekitModels.DisconnectReason.AGENT_ERROR,
         LivekitModels.DisconnectReason.UNKNOWN_REASON,
         LivekitModels.DisconnectReason.UNRECOGNIZED,
         null,

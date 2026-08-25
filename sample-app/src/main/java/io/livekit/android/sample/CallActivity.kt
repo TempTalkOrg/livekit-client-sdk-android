@@ -23,9 +23,12 @@ import android.view.WindowManager
 import android.widget.EditText
 import android.widget.SeekBar
 import android.widget.Toast
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
@@ -38,6 +41,7 @@ import com.xwray.groupie.GroupieAdapter
 import io.livekit.android.audio.AudioProcessorOptions
 import io.livekit.android.sample.common.R
 import io.livekit.android.sample.databinding.CallActivityBinding
+import io.livekit.android.sample.dialog.RpcTestDialogFragment
 import io.livekit.android.sample.dialog.showAudioProcessorSwitchDialog
 import io.livekit.android.sample.dialog.showDebugMenuDialog
 import io.livekit.android.sample.dialog.showSelectAudioDeviceDialog
@@ -75,6 +79,7 @@ class CallActivity : AppCompatActivity() {
             quic = args.quicOn,
             quicDeviceType = args.quicDeviceType,
             quicCidTag = args.quicCidTag,
+            quicConnectTimeoutMs = args.quicConnectTimeoutMs,
             serverHost = args.serverHost,
             caCertPem = args.caCertPem,
             proxyConfig = ProxyConfig.fromInputs(
@@ -107,11 +112,19 @@ class CallActivity : AppCompatActivity() {
 
     @androidx.camera.camera2.interop.ExperimentalCamera2Interop
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         binding = CallActivityBinding.inflate(layoutInflater)
 
         setContentView(binding.root)
+        ViewCompat.setOnApplyWindowInsetsListener(binding.root) { v, windowInsets ->
+            val bars = windowInsets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout(),
+            )
+            v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+            windowInsets
+        }
 
         // Audience row setup
         val audienceAdapter = GroupieAdapter()
@@ -124,7 +137,9 @@ class CallActivity : AppCompatActivity() {
             repeatOnLifecycle(Lifecycle.State.CREATED) {
                 viewModel.participants
                     .collect { participants ->
-                        val items = participants.map { participant -> ParticipantItem(viewModel.room, participant) }
+                        val items = participants.map { participant ->
+                            ParticipantItem(viewModel.room, participant)
+                        }
                         audienceAdapter.update(items)
                     }
             }
@@ -140,7 +155,13 @@ class CallActivity : AppCompatActivity() {
             repeatOnLifecycle(Lifecycle.State.CREATED) {
                 viewModel.primarySpeaker.collectLatest { speaker ->
                     val items = listOfNotNull(speaker)
-                        .map { participant -> ParticipantItem(viewModel.room, participant, speakerView = true) }
+                        .map { participant ->
+                            ParticipantItem(
+                                viewModel.room,
+                                participant,
+                                speakerView = true,
+                            )
+                        }
                     speakerAdapter.update(items)
                 }
             }
@@ -205,6 +226,20 @@ class CallActivity : AppCompatActivity() {
             repeatOnLifecycle(Lifecycle.State.CREATED) {
                 viewModel.connectionStatus.collect { status ->
                     binding.connectionStatus.text = status
+                }
+            }
+        }
+
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.CREATED) {
+                viewModel.mediaSendUiState.collect { mediaSendUiState ->
+                    val visible = mediaSendUiState == MediaSendUiState.MEDIA_RECOVERING
+                    binding.mediaSendBanner.setText(io.livekit.android.sample.R.string.media_send_issue)
+                    binding.mediaSendBanner.visibility = if (visible) {
+                        android.view.View.VISIBLE
+                    } else {
+                        android.view.View.GONE
+                    }
                 }
             }
         }
@@ -353,6 +388,10 @@ class CallActivity : AppCompatActivity() {
         binding.debugMenu.setOnClickListener {
             showDebugMenuDialog(viewModel)
         }
+
+        binding.rpcTest.setOnClickListener {
+            RpcTestDialogFragment().show(supportFragmentManager, "rpc_test")
+        }
     }
 
     override fun onResume() {
@@ -452,5 +491,6 @@ class CallActivity : AppCompatActivity() {
         val proxyTurnSecret: String = "",
         val proxySni: String = "",
         val stressTest: StressTest,
+        val quicConnectTimeoutMs: Int = DEFAULT_QUIC_CONNECT_TIMEOUT_MS,
     ) : Parcelable
 }

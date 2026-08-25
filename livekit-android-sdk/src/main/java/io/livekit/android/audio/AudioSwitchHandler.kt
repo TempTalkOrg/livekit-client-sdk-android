@@ -1,5 +1,5 @@
 /*
- * Copyright 2023-2025 LiveKit, Inc.
+ * Copyright 2023-2026 LiveKit, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,6 +27,7 @@ import com.twilio.audioswitch.AbstractAudioSwitch
 import com.twilio.audioswitch.AudioDevice
 import com.twilio.audioswitch.AudioDeviceChangeListener
 import com.twilio.audioswitch.AudioSwitch
+import com.twilio.audioswitch.CommDeviceAudioSwitch
 import com.twilio.audioswitch.LegacyAudioSwitch
 import io.livekit.android.room.Room
 import io.livekit.android.util.LKLog
@@ -48,7 +49,7 @@ constructor(private val context: Context) : AudioHandler {
     /**
      * Toggle whether logging is enabled for [AudioSwitch]. By default, this is set to false.
      */
-    var loggingEnabled = false
+    var loggingEnabled = true
 
     /**
      * Listen to changes in the available and active audio devices.
@@ -96,6 +97,9 @@ constructor(private val context: Context) : AudioHandler {
         }
     }
 
+    @Volatile
+    private var preferredDeviceListBacking: List<Class<out AudioDevice>>? = null
+
     /**
      * The preferred priority of audio devices to use. The first available audio device will be used.
      *
@@ -104,8 +108,27 @@ constructor(private val context: Context) : AudioHandler {
      * 2. WiredHeadset
      * 3. Speakerphone
      * 4. Earpiece
+     *
+     * Changes to this value after [start] has been called will still be applied
+     * to the underlying [AbstractAudioSwitch] instance.
      */
-    var preferredDeviceList: List<Class<out AudioDevice>>? = null
+    var preferredDeviceList: List<Class<out AudioDevice>>?
+        get() = preferredDeviceListBacking
+        set(value) {
+            preferredDeviceListBacking = value
+            val list = value ?: defaultPreferredDeviceList
+            val h = handler
+            val sw = audioSwitch
+            if (h != null && sw != null) {
+                if (Looper.myLooper() == h.looper) {
+                    sw.setPreferredDeviceList(list)
+                } else {
+                    h.post {
+                        audioSwitch?.setPreferredDeviceList(list)
+                    }
+                }
+            }
+        }
 
     /**
      * When true, AudioSwitchHandler will request audio focus on start and abandon on stop.
@@ -176,6 +199,9 @@ constructor(private val context: Context) : AudioHandler {
      */
     var forceHandleAudioRouting = false
 
+    // Volatile and nulled synchronously in stop() (rather than only inside the posted
+    // teardown runnable) so that a subsequent start() reliably observes the teardown.
+    @Volatile
     private var audioSwitch: AbstractAudioSwitch? = null
 
     // AudioSwitch is not threadsafe, so all calls should be done through a single thread.
@@ -188,23 +214,34 @@ constructor(private val context: Context) : AudioHandler {
             LKLog.i { "AudioSwitchHandler called start multiple times?" }
         }
 
-        if (thread == null) {
-            thread = HandlerThread("AudioSwitchHandlerThread").also { it.start() }
+        val switchThread = thread ?: HandlerThread("AudioSwitchHandlerThread").also {
+            it.start()
+            thread = it
         }
-        if (handler == null) {
-            handler = Handler(thread!!.looper)
-        }
+        val switchHandler = handler ?: Handler(switchThread.looper).also { handler = it }
 
         if (audioSwitch == null) {
-            handler?.removeCallbacksAndMessages(null)
-            handler?.postAtFrontOfQueue {
+            switchHandler.removeCallbacksAndMessages(null)
+            switchHandler.postAtFrontOfQueue {
+                // Handing our handler to the switch keeps the system audio device callbacks and the
+                // routing calls they trigger on this thread, so nothing audio related runs on the main
+                // thread and the switch's single threaded access contract actually holds.
                 val switch =
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        CommDeviceAudioSwitch(
+                            context = context,
+                            loggingEnabled = loggingEnabled,
+                            audioFocusChangeListener = onAudioFocusChangeDispatcher,
+                            preferredDeviceList = preferredDeviceList ?: defaultPreferredDeviceList,
+                            handler = switchHandler,
+                        )
+                    } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                         AudioSwitch(
                             context = context,
                             loggingEnabled = loggingEnabled,
                             audioFocusChangeListener = onAudioFocusChangeDispatcher,
                             preferredDeviceList = preferredDeviceList ?: defaultPreferredDeviceList,
+                            handler = switchHandler,
                         )
                     } else {
                         LegacyAudioSwitch(
@@ -212,6 +249,7 @@ constructor(private val context: Context) : AudioHandler {
                             loggingEnabled = loggingEnabled,
                             audioFocusChangeListener = onAudioFocusChangeDispatcher,
                             preferredDeviceList = preferredDeviceList ?: defaultPreferredDeviceList,
+                            handler = switchHandler,
                         )
                     }
                 switch.manageAudioFocus = manageAudioFocus
@@ -231,10 +269,17 @@ constructor(private val context: Context) : AudioHandler {
 
     @Synchronized
     override fun stop() {
+        // Null audioSwitch synchronously (under the lock) so a subsequent start() reliably
+        // observes the teardown and re-creates the switch. Previously it was nulled inside the
+        // posted runnable on the handler thread; with handler/thread torn down synchronously
+        // below, a fast start() could read a stale, already-stopped switch and skip re-creation,
+        // leaving audio routing broken (e.g. stuck on the earpiece) until the next connect.
+        // The switch's stop() is still posted, since AbstractAudioSwitch is not threadsafe.
+        val switchToStop = audioSwitch
+        audioSwitch = null
         handler?.removeCallbacksAndMessages(null)
         handler?.postAtFrontOfQueue {
-            audioSwitch?.stop()
-            audioSwitch = null
+            switchToStop?.stop()
         }
         thread?.quitSafely()
 
@@ -255,7 +300,13 @@ constructor(private val context: Context) : AudioHandler {
         get() = audioSwitch?.availableAudioDevices ?: listOf()
 
     /**
-     * Select a specific audio device.
+     * Select a specific audio device. The selection is sticky: it overrides
+     * [preferredDeviceList], persists across device hot-plug, and is restored
+     * automatically if the device temporarily disappears and later reconnects.
+     * Pass `null` to clear a sticky selection.
+     *
+     * If you only need to change which device is preferred when several are
+     * available, set [preferredDeviceList] instead.
      */
     @Synchronized
     fun selectDevice(audioDevice: AudioDevice?) {

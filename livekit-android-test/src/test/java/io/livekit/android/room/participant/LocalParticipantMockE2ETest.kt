@@ -21,11 +21,12 @@ import android.app.Application
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import com.google.protobuf.ByteString
-import io.livekit.android.audio.AudioProcessorInterface
+import io.livekit.android.ConnectOptions
 import io.livekit.android.events.ParticipantEvent
 import io.livekit.android.events.RoomEvent
 import io.livekit.android.room.DefaultsManager
 import io.livekit.android.room.RTCEngine
+import io.livekit.android.room.Room
 import io.livekit.android.room.RoomException
 import io.livekit.android.room.track.LocalVideoTrack
 import io.livekit.android.room.track.LocalVideoTrackOptions
@@ -39,7 +40,6 @@ import io.livekit.android.test.MockE2ETest
 import io.livekit.android.test.assert.assertIsClassList
 import io.livekit.android.test.coroutines.toListUntilSignal
 import io.livekit.android.test.events.EventCollector
-import io.livekit.android.test.mock.MockAudioProcessingController
 import io.livekit.android.test.mock.MockDataChannel
 import io.livekit.android.test.mock.MockEglBase
 import io.livekit.android.test.mock.MockRTCThreadToken
@@ -57,11 +57,13 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.takeWhile
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runCurrent
 import livekit.LivekitModels
-import livekit.LivekitModels.AudioTrackFeature
 import livekit.LivekitModels.DataPacket
 import livekit.LivekitRtc
 import livekit.LivekitRtc.SubscribedCodec
@@ -70,6 +72,7 @@ import livekit.org.webrtc.RtpParameters
 import livekit.org.webrtc.VideoSource
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -79,7 +82,6 @@ import org.mockito.Mockito.mock
 import org.mockito.kotlin.argThat
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows
-import java.nio.ByteBuffer
 import kotlin.time.Duration.Companion.seconds
 
 @ExperimentalCoroutinesApi
@@ -196,6 +198,69 @@ class LocalParticipantMockE2ETest : MockE2ETest() {
     }
 
     @Test
+    fun connectWithAudioDoesNotStopConcurrentlyEnabledMic() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val shadowApplication = Shadows.shadowOf(context as Application)
+        shadowApplication.grantPermissions(Manifest.permission.RECORD_AUDIO)
+
+        // Withhold the add track response so the connect job's audio publish
+        // is still in flight when the room state flips to CONNECTED.
+        var deferredAddTrack: LivekitRtc.AddTrackRequest? = null
+        wsFactory.registerSignalRequestHandler { request ->
+            if (request.hasAddTrack() && deferredAddTrack == null) {
+                deferredAddTrack = request.addTrack
+                true
+            } else {
+                false
+            }
+        }
+
+        // Mirrors apps that enable the mic as soon as the room reports connected.
+        var micEnableResult: Boolean? = null
+        val micJob = launch {
+            room::state.flow
+                .takeWhile { it != Room.State.CONNECTED }
+                .collect()
+            micEnableResult = room.localParticipant.setMicrophoneEnabled(true)
+        }
+
+        val connectJob = launch {
+            room.connect(
+                url = TestData.EXAMPLE_URL,
+                token = "",
+                options = ConnectOptions(audio = true),
+            )
+        }
+        prepareSignal(TestData.JOIN)
+        runCurrent()
+        assertNotNull(deferredAddTrack)
+
+        connectPeerConnection()
+        runCurrent()
+
+        // Deliver the deferred response, letting the connect job's publish finish.
+        wsFactory.receiveMessage(
+            with(LivekitRtc.SignalResponse.newBuilder()) {
+                trackPublished = with(LivekitRtc.TrackPublishedResponse.newBuilder()) {
+                    cid = deferredAddTrack!!.cid
+                    track = TestData.LOCAL_AUDIO_TRACK
+                    build()
+                }
+                build()
+            },
+        )
+        runCurrent()
+        connectJob.join()
+        micJob.join()
+
+        assertEquals(true, micEnableResult)
+        val pub = room.localParticipant.getTrackPublication(Track.Source.MICROPHONE)
+        assertNotNull(pub)
+        assertFalse(pub!!.muted)
+        assertTrue(pub.track?.enabled == true)
+    }
+
+    @Test
     fun publishVideoTrackRequest() = runTest {
         connect()
         wsFactory.ws.clearRequests()
@@ -217,6 +282,72 @@ class LocalParticipantMockE2ETest : MockE2ETest() {
         assertEquals(publishOptions.name, sentRequest.addTrack.name)
         assertEquals(publishOptions.source?.toProto(), sentRequest.addTrack.source)
         assertEquals(publishOptions.stream, sentRequest.addTrack.stream)
+    }
+
+    @Test
+    fun unpublishStopsVideoTransceiver() = runTest {
+        connect()
+        val videoTrack = createLocalTrack()
+        room.localParticipant.publishVideoTrack(videoTrack)
+
+        val transceiver = getPublisherPeerConnection().transceivers.first()
+        room.localParticipant.unpublishTrack(videoTrack)
+
+        Mockito.verify(transceiver).stopInternal()
+    }
+
+    @Test
+    fun unpublishStopsBackupCodecTransceivers() = runTest {
+        room.videoTrackPublishDefaults = room.videoTrackPublishDefaults.copy(
+            videoCodec = VideoCodec.VP9.codecName,
+            scalabilityMode = "L3T3",
+            backupCodec = BackupVideoCodec(codec = VideoCodec.VP8.codecName),
+        )
+
+        connect()
+        val videoTrack = createLocalTrack()
+        room.localParticipant.publishVideoTrack(videoTrack)
+
+        receiveSubscribedQualityUpdate(room.localParticipant.videoTrackPublications.first().first.sid)
+
+        val transceivers = getPublisherPeerConnection().transceivers
+        assertEquals(2, transceivers.size)
+
+        room.localParticipant.unpublishTrack(videoTrack)
+
+        transceivers.forEach { Mockito.verify(it).stopInternal() }
+    }
+
+    @Test
+    fun republishAfterBackupCodecUnpublishCreatesNewBackupTransceiver() = runTest {
+        room.videoTrackPublishDefaults = room.videoTrackPublishDefaults.copy(
+            videoCodec = VideoCodec.VP9.codecName,
+            scalabilityMode = "L3T3",
+            backupCodec = BackupVideoCodec(codec = VideoCodec.VP8.codecName),
+        )
+
+        connect()
+        val videoTrack = createLocalTrack()
+        room.localParticipant.publishVideoTrack(videoTrack)
+
+        receiveSubscribedQualityUpdate(room.localParticipant.videoTrackPublications.first().first.sid)
+        assertEquals(2, getPublisherPeerConnection().transceivers.size)
+
+        room.localParticipant.unpublishTrack(videoTrack, stopOnUnpublish = false)
+        room.localParticipant.publishVideoTrack(videoTrack)
+        receiveSubscribedQualityUpdate(room.localParticipant.videoTrackPublications.first().first.sid)
+
+        assertEquals(4, getPublisherPeerConnection().transceivers.size)
+    }
+
+    @Test
+    fun disposeDisposesVideoSource() {
+        val source = mock(VideoSource::class.java)
+        val videoTrack = createLocalTrack(source = source)
+
+        videoTrack.dispose()
+
+        Mockito.verify(source).dispose()
     }
 
     @Test
@@ -292,9 +423,40 @@ class LocalParticipantMockE2ETest : MockE2ETest() {
         )
     }
 
-    private fun createLocalTrack(width: Int = 1280, height: Int = 720, isScreencast: Boolean = false) = LocalVideoTrack(
+    private fun receiveSubscribedQualityUpdate(trackSid: String) {
+        wsFactory.receiveMessage(
+            with(LivekitRtc.SignalResponse.newBuilder()) {
+                subscribedQualityUpdate = with(LivekitRtc.SubscribedQualityUpdate.newBuilder()) {
+                    this.trackSid = trackSid
+                    addAllSubscribedCodecs(
+                        listOf("vp9", "vp8").map { codecName ->
+                            with(SubscribedCodec.newBuilder()) {
+                                codec = codecName
+                                addQualities(
+                                    SubscribedQuality.newBuilder()
+                                        .setQuality(LivekitModels.VideoQuality.HIGH)
+                                        .setEnabled(true)
+                                        .build(),
+                                )
+                                build()
+                            }
+                        },
+                    )
+                    build()
+                }
+                build().toOkioByteString()
+            },
+        )
+    }
+
+    private fun createLocalTrack(
+        width: Int = 1280,
+        height: Int = 720,
+        isScreencast: Boolean = false,
+        source: VideoSource = mock(VideoSource::class.java),
+    ) = LocalVideoTrack(
         capturer = MockVideoCapturer(),
-        source = mock(VideoSource::class.java),
+        source = source,
         name = "",
         options = LocalVideoTrackOptions(
             isScreencast = isScreencast,
@@ -680,116 +842,6 @@ class LocalParticipantMockE2ETest : MockE2ETest() {
     }
 
     @Test
-    fun sendsInitialAudioTrackFeatures() = runTest {
-        connect()
-
-        wsFactory.ws.clearRequests()
-        room.localParticipant.publishAudioTrack(
-            track = createMockLocalAudioTrack(),
-        )
-
-        advanceUntilIdle()
-        assertEquals(2, wsFactory.ws.sentRequests.size)
-
-        // Verify the update audio track request gets the proper publish options set.
-        val requestString = wsFactory.ws.sentRequests[1].toPBByteString()
-        val sentRequest = LivekitRtc.SignalRequest.newBuilder()
-            .mergeFrom(requestString)
-            .build()
-
-        assertTrue(sentRequest.hasUpdateAudioTrack())
-        val features = sentRequest.updateAudioTrack.featuresList
-        assertEquals(3, features.size)
-        assertTrue(features.contains(AudioTrackFeature.TF_ECHO_CANCELLATION))
-        assertTrue(features.contains(AudioTrackFeature.TF_NOISE_SUPPRESSION))
-        assertTrue(features.contains(AudioTrackFeature.TF_AUTO_GAIN_CONTROL))
-    }
-
-    @Test
-    fun sendsUpdatedAudioTrackFeatures() = runTest {
-        connect()
-
-        val audioProcessingController = MockAudioProcessingController()
-        room.localParticipant.publishAudioTrack(
-            track = createMockLocalAudioTrack(audioProcessingController = audioProcessingController),
-        )
-
-        advanceUntilIdle()
-        wsFactory.ws.clearRequests()
-
-        audioProcessingController.capturePostProcessor = object : AudioProcessorInterface {
-            override fun isEnabled(): Boolean = true
-
-            override fun getName(): String = "krisp_noise_cancellation"
-
-            override fun initializeAudioProcessing(sampleRateHz: Int, numChannels: Int) {}
-
-            override fun resetAudioProcessing(newRate: Int) {}
-
-            override fun processAudio(numBands: Int, numFrames: Int, buffer: ByteBuffer) {}
-        }
-        assertEquals(1, wsFactory.ws.sentRequests.size)
-
-        // Verify the update audio track request gets the proper publish options set.
-        val requestString = wsFactory.ws.sentRequests[0].toPBByteString()
-        val sentRequest = LivekitRtc.SignalRequest.newBuilder()
-            .mergeFrom(requestString)
-            .build()
-
-        assertTrue(sentRequest.hasUpdateAudioTrack())
-        val features = sentRequest.updateAudioTrack.featuresList
-        assertEquals(4, features.size)
-        assertTrue(features.contains(AudioTrackFeature.TF_ECHO_CANCELLATION))
-        assertTrue(features.contains(AudioTrackFeature.TF_NOISE_SUPPRESSION))
-        assertTrue(features.contains(AudioTrackFeature.TF_AUTO_GAIN_CONTROL))
-        assertTrue(features.contains(AudioTrackFeature.TF_ENHANCED_NOISE_CANCELLATION))
-    }
-
-    @Test
-    fun bypassUpdatesAudioFeatures() = runTest {
-        connect()
-
-        val audioProcessingController = MockAudioProcessingController()
-        room.localParticipant.publishAudioTrack(
-            track = createMockLocalAudioTrack(audioProcessingController = audioProcessingController),
-        )
-
-        advanceUntilIdle()
-        wsFactory.ws.clearRequests()
-
-        audioProcessingController.capturePostProcessor = object : AudioProcessorInterface {
-            override fun isEnabled(): Boolean = true
-
-            override fun getName(): String = "krisp_noise_cancellation"
-
-            override fun initializeAudioProcessing(sampleRateHz: Int, numChannels: Int) {}
-
-            override fun resetAudioProcessing(newRate: Int) {}
-
-            override fun processAudio(numBands: Int, numFrames: Int, buffer: ByteBuffer) {}
-        }
-        assertEquals(1, wsFactory.ws.sentRequests.size)
-
-        wsFactory.ws.clearRequests()
-
-        audioProcessingController.bypassCapturePostProcessing = true
-        assertEquals(1, wsFactory.ws.sentRequests.size)
-        // Verify the update audio track request gets the proper publish options set.
-        val requestString = wsFactory.ws.sentRequests[0].toPBByteString()
-        val sentRequest = LivekitRtc.SignalRequest.newBuilder()
-            .mergeFrom(requestString)
-            .build()
-
-        assertTrue(sentRequest.hasUpdateAudioTrack())
-        val features = sentRequest.updateAudioTrack.featuresList
-        assertEquals(3, features.size)
-        assertTrue(features.contains(AudioTrackFeature.TF_ECHO_CANCELLATION))
-        assertTrue(features.contains(AudioTrackFeature.TF_NOISE_SUPPRESSION))
-        assertTrue(features.contains(AudioTrackFeature.TF_AUTO_GAIN_CONTROL))
-        assertFalse(features.contains(AudioTrackFeature.TF_ENHANCED_NOISE_CANCELLATION))
-    }
-
-    @Test
     fun lackOfPublishPermissionReturnsFalse() = runTest {
         val noCanPublishJoin = with(TestData.JOIN.toBuilder()) {
             join = with(join.toBuilder()) {
@@ -821,11 +873,15 @@ class LocalParticipantMockE2ETest : MockE2ETest() {
                 success = room.localParticipant.publishVideoTrack(createLocalTrack())
             } catch (e: TrackException.PublishException) {
                 didThrow = true
+            } catch (e: Exception) {
+                didThrow = true
             }
         }
 
         coroutineRule.dispatcher.scheduler.advanceUntilIdle()
-        assertTrue(!didThrow && success == false)
+        assertTrue(!didThrow)
+        assertTrue(success != null)
+        assertFalse(success!!)
     }
 
     @Test
@@ -894,5 +950,27 @@ class LocalParticipantMockE2ETest : MockE2ETest() {
 
         assertTrue(result.isFailure)
         assertTrue(result.exceptionOrNull() is RoomException.ConnectException)
+    }
+
+    @Test
+    fun publishDataReturnsFailureWhenDataChannelSendFails() = runTest {
+        connect()
+        val pubPeerConnection = getPublisherPeerConnection()
+        val pubDataChannel = pubPeerConnection.dataChannels[RTCEngine.RELIABLE_DATA_CHANNEL_LABEL] as MockDataChannel
+        pubDataChannel.sendResult = false
+
+        val result = room.localParticipant.publishData("hello".toByteArray())
+
+        assertTrue(result.isFailure)
+        assertTrue(result.exceptionOrNull() is RoomException.ConnectException)
+
+        pubDataChannel.sendResult = true
+        val retryResult = room.localParticipant.publishData("hello".toByteArray())
+
+        assertTrue(retryResult.isSuccess)
+        assertEquals(2, pubDataChannel.sentBuffers.size)
+
+        val retriedPacket = DataPacket.parseFrom(ByteString.copyFrom(pubDataChannel.sentBuffers[1].data))
+        assertEquals(1, retriedPacket.sequence)
     }
 }

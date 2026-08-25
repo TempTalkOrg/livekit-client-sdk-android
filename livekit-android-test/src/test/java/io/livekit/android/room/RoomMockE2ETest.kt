@@ -1,5 +1,5 @@
 /*
- * Copyright 2023-2025 LiveKit, Inc.
+ * Copyright 2023-2026 LiveKit, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,10 +40,13 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.advanceUntilIdle
 import livekit.LivekitRtc
+import livekit.org.webrtc.PeerConnection
 import org.junit.Assert
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.mockito.Mockito
@@ -345,13 +348,17 @@ class RoomMockE2ETest : MockE2ETest() {
             callback.onAvailable(network)
         }
 
-        coroutineRule.dispatcher.scheduler.advanceUntilIdle()
+        coroutineRule.dispatcher.scheduler.advanceTimeBy(1000)
+        wsFactory.listener.onOpen(wsFactory.ws, createOpenResponse(wsFactory.request))
+        simulateMessageFromServer(TestData.RECONNECT)
+
         val events = eventCollector.stopCollecting()
 
         assertEquals(
             listOf(
                 ConnectionState.CONNECTED,
                 ConnectionState.RESUMING,
+                ConnectionState.CONNECTED,
             ),
             events,
         )
@@ -496,5 +503,198 @@ class RoomMockE2ETest : MockE2ETest() {
         room.disconnect()
         connect()
         assertEquals(room.state, Room.State.CONNECTED)
+    }
+
+    @Test
+    fun mediaSendConnectionStateIdleUntilPublish() = runTest {
+        connect()
+        assertEquals(Room.State.CONNECTED, room.state)
+        assertEquals(MediaSendConnectionState.IDLE, room.mediaSendConnectionState)
+    }
+
+    @Test
+    fun mediaSendConnectionStateStartsConnectingDuringFirstPublisherNegotiation() = runTest {
+        connect()
+
+        val collector = FlowCollector(room::mediaSendConnectionState.flow, coroutineRule.scope)
+        getPublisherPeerConnection().observer?.onRenegotiationNeeded()
+        advanceUntilIdle()
+
+        assertEquals(Room.State.CONNECTED, room.state)
+        assertEquals(MediaSendConnectionState.CONNECTING, room.mediaSendConnectionState)
+        assertTrue(collector.stopCollecting().contains(MediaSendConnectionState.CONNECTING))
+    }
+
+    @Test
+    fun mediaSendConnectionStateTracksPublisherDisconnect() = runTest {
+        connect()
+
+        wsFactory.registerSignalRequestHandler { request ->
+            if (request.hasOffer()) {
+                val answer = with(LivekitRtc.SignalResponse.newBuilder()) {
+                    answer = with(LivekitRtc.SessionDescription.newBuilder()) {
+                        sdp = "remote_answer"
+                        type = "answer"
+                        id = request.offer.id
+                        build()
+                    }
+                    build()
+                }
+                wsFactory.receiveMessage(answer)
+                true
+            } else {
+                false
+            }
+        }
+
+        val eventCollector = EventCollector(room.events, coroutineRule.scope)
+        val publisher = getPublisherPeerConnection()
+        publisher.observer?.onRenegotiationNeeded()
+        advanceUntilIdle()
+
+        assertEquals(Room.State.CONNECTED, room.state)
+        assertEquals(MediaSendConnectionState.CONNECTED, room.mediaSendConnectionState)
+
+        // DISCONNECTED is temporary and does not trigger engine reconnect (unlike FAILED),
+        // so Room can remain CONNECTED while media-send reports RECOVERING.
+        publisher.moveToIceConnectionState(PeerConnection.IceConnectionState.DISCONNECTED)
+        advanceUntilIdle()
+
+        assertEquals(Room.State.CONNECTED, room.state)
+        assertEquals(MediaSendConnectionState.RECOVERING, room.mediaSendConnectionState)
+
+        val events = eventCollector.stopCollecting()
+            .filterIsInstance<RoomEvent.MediaSendConnectionStateChanged>()
+        assertTrue(events.any { it.state == MediaSendConnectionState.CONNECTED })
+        assertTrue(events.any { it.state == MediaSendConnectionState.RECOVERING })
+    }
+
+    @Test
+    fun mediaSendConnectionStateWholeRecoveryOverridesPublisherAndDedupesEvents() = runTest {
+        connect()
+
+        wsFactory.registerSignalRequestHandler { request ->
+            if (request.hasOffer()) {
+                val answer = with(LivekitRtc.SignalResponse.newBuilder()) {
+                    answer = with(LivekitRtc.SessionDescription.newBuilder()) {
+                        sdp = "remote_answer"
+                        type = "answer"
+                        id = request.offer.id
+                        build()
+                    }
+                    build()
+                }
+                wsFactory.receiveMessage(answer)
+                true
+            } else {
+                false
+            }
+        }
+
+        val publisher = getPublisherPeerConnection()
+        publisher.observer?.onRenegotiationNeeded()
+        advanceUntilIdle()
+        assertEquals(MediaSendConnectionState.CONNECTED, room.mediaSendConnectionState)
+
+        val eventCollector = EventCollector(room.events, coroutineRule.scope)
+        val engine = component.rtcEngine()
+        engine.connectionState = ConnectionState.DISCONNECTED
+        advanceUntilIdle()
+        publisher.moveToIceConnectionState(PeerConnection.IceConnectionState.FAILED)
+        advanceUntilIdle()
+        engine.connectionState = ConnectionState.DISCONNECTED
+        advanceUntilIdle()
+
+        assertEquals(Room.State.CONNECTED, room.state)
+        assertEquals(MediaSendConnectionState.ROOM_RECOVERING, room.mediaSendConnectionState)
+        assertTrue(room.isWholeConnectionRecovering)
+
+        val events = eventCollector.stopCollecting()
+            .filterIsInstance<RoomEvent.MediaSendConnectionStateChanged>()
+            .filter { it.state == MediaSendConnectionState.ROOM_RECOVERING }
+        assertEquals(1, events.size)
+    }
+
+    @Test
+    fun mediaSendConnectionStateClearsOnceNetworkAndEngineAreStable() = runTest {
+        connect()
+
+        val eventCollector = EventCollector(room.events, coroutineRule.scope)
+        val engine = component.rtcEngine()
+        val network = Mockito.mock(Network::class.java)
+        val callbacks = component.networkCallbackRegistry().networkCallbacks
+
+        callbacks.forEach { it.onAvailable(network) }
+        callbacks.forEach { it.onLost(network) }
+        advanceUntilIdle()
+        assertEquals(MediaSendConnectionState.ROOM_RECOVERING, room.mediaSendConnectionState)
+
+        callbacks.forEach { it.onAvailable(network) }
+        advanceUntilIdle()
+        assertEquals(MediaSendConnectionState.ROOM_RECOVERING, room.mediaSendConnectionState)
+
+        engine.connectionState = ConnectionState.RESUMING
+        advanceUntilIdle()
+        engine.connectionState = ConnectionState.CONNECTED
+        advanceUntilIdle()
+        assertEquals(MediaSendConnectionState.CONNECTED, room.mediaSendConnectionState)
+
+        val states = eventCollector.stopCollecting()
+            .filterIsInstance<RoomEvent.MediaSendConnectionStateChanged>()
+            .map { it.state }
+        assertEquals(
+            listOf(
+                MediaSendConnectionState.ROOM_RECOVERING,
+                MediaSendConnectionState.CONNECTED,
+            ),
+            states,
+        )
+    }
+
+    @Test
+    fun mediaSendConnectionStateResetsOnDisconnect() = runTest {
+        connect()
+
+        wsFactory.registerSignalRequestHandler { request ->
+            if (request.hasOffer()) {
+                val answer = with(LivekitRtc.SignalResponse.newBuilder()) {
+                    answer = with(LivekitRtc.SessionDescription.newBuilder()) {
+                        sdp = "remote_answer"
+                        type = "answer"
+                        id = request.offer.id
+                        build()
+                    }
+                    build()
+                }
+                wsFactory.receiveMessage(answer)
+                true
+            } else {
+                false
+            }
+        }
+
+        getPublisherPeerConnection().observer?.onRenegotiationNeeded()
+        advanceUntilIdle()
+        assertEquals(MediaSendConnectionState.CONNECTED, room.mediaSendConnectionState)
+
+        val eventCollector = EventCollector(room.events, coroutineRule.scope)
+        component.rtcEngine().connectionState = ConnectionState.DISCONNECTED
+        advanceUntilIdle()
+        assertEquals(MediaSendConnectionState.ROOM_RECOVERING, room.mediaSendConnectionState)
+        assertTrue(room.isWholeConnectionRecovering)
+
+        room.disconnect()
+        assertEquals(MediaSendConnectionState.IDLE, room.mediaSendConnectionState)
+        assertEquals(false, room.isWholeConnectionRecovering)
+        val states = eventCollector.stopCollecting()
+            .filterIsInstance<RoomEvent.MediaSendConnectionStateChanged>()
+            .map { it.state }
+        assertEquals(
+            listOf(
+                MediaSendConnectionState.ROOM_RECOVERING,
+                MediaSendConnectionState.IDLE,
+            ),
+            states,
+        )
     }
 }

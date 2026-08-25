@@ -56,8 +56,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun getSavedToken() = preferences.getString(PREFERENCES_KEY_TOKEN, TOKEN) as String
     fun getE2EEOptionsOn() = preferences.getBoolean(PREFERENCES_KEY_E2EE_ON, false)
     fun getSavedE2EEKey() = preferences.getString(PREFERENCES_KEY_E2EE_KEY, E2EE_KEY) as String
+    fun getQuicSignalOn() = preferences.getBoolean(PREFERENCES_KEY_QUIC_SIGNAL_ON, false)
     fun getQuicDeviceType() = preferences.getInt(PREFERENCES_KEY_QUIC_DEVICE_TYPE, DEFAULT_QUIC_DEVICE_TYPE)
     fun getQuicCidTag() = preferences.getString(PREFERENCES_KEY_QUIC_CID_TAG, DEFAULT_QUIC_CID_TAG) ?: DEFAULT_QUIC_CID_TAG
+    fun getQuicConnectTimeoutMs() =
+        preferences.getInt(PREFERENCES_KEY_QUIC_CONNECT_TIMEOUT_MS, DEFAULT_QUIC_CONNECT_TIMEOUT_MS)
 
     /** Selected RTC proxy id, or [PROXY_ID_NONE] when media should not be relayed. */
     fun getSavedProxyId(): String {
@@ -104,6 +107,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun setQuicSignalOn(yesno: Boolean) {
+        preferences.edit {
+            putBoolean(PREFERENCES_KEY_QUIC_SIGNAL_ON, yesno)
+        }
+    }
+
     fun setQuicDeviceType(value: Int) {
         preferences.edit {
             putInt(PREFERENCES_KEY_QUIC_DEVICE_TYPE, value)
@@ -113,6 +122,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun setQuicCidTag(value: String) {
         preferences.edit {
             putString(PREFERENCES_KEY_QUIC_CID_TAG, value)
+        }
+    }
+
+    fun setQuicConnectTimeoutMs(value: Int) {
+        preferences.edit {
+            putInt(PREFERENCES_KEY_QUIC_CONNECT_TIMEOUT_MS, value)
         }
     }
 
@@ -126,8 +141,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         private const val PREFERENCES_KEY_PRESET_ID = "preset_id"
         private const val PREFERENCES_KEY_E2EE_ON = "enable_e2ee"
         private const val PREFERENCES_KEY_E2EE_KEY = "e2ee_key"
+        private const val PREFERENCES_KEY_QUIC_SIGNAL_ON = "quic_signal_on"
         private const val PREFERENCES_KEY_QUIC_DEVICE_TYPE = "quic_device_type"
         private const val PREFERENCES_KEY_QUIC_CID_TAG = "quic_cid_tag"
+        private const val PREFERENCES_KEY_QUIC_CONNECT_TIMEOUT_MS = "quic_connect_timeout_ms"
         private const val PREFERENCES_KEY_RTC_PROXY_ID = "rtc_proxy_id"
 
         /** Sentinel proxy id meaning "do not relay media through any proxy". */

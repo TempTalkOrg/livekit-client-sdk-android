@@ -31,6 +31,8 @@ import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManagerFactory
 import javax.net.ssl.X509TrustManager
 
+// Most of the members are overrides mandated by SignalTransport and WebSocketListener.
+@Suppress("TooManyFunctions")
 class WebSocketTransport(
     override val attemptId: Long,
     override val sendOnOpen: ByteString?,

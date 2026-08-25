@@ -35,6 +35,17 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 
+internal const val DEFAULT_QUIC_CONNECT_TIMEOUT_MS = 7000
+private const val MIN_QUIC_CONNECT_TIMEOUT_MS = 1000
+private const val MAX_QUIC_CONNECT_TIMEOUT_MS = 15000
+
+internal fun normalizeQuicConnectTimeoutMs(value: Int): Int =
+    if (value in MIN_QUIC_CONNECT_TIMEOUT_MS..MAX_QUIC_CONNECT_TIMEOUT_MS) {
+        value
+    } else {
+        DEFAULT_QUIC_CONNECT_TIMEOUT_MS
+    }
+
 class QuicTransport(
     override val attemptId: Long,
     override val sendOnOpen: ByteString?,
@@ -180,8 +191,18 @@ class QuicTransport(
 
         val host = url.replaceFirst("wss", "https")
         val props = authObject.toString()
-        LKLog.i { "[quic] connect: alpn=${config.serverHost}, url=[$host], ${this@QuicTransport}" }
-        this.connection?.connect(host, props, 7 * 1000)
+        val effectiveTimeoutMs = normalizeQuicConnectTimeoutMs(options.quicConnectTimeoutMs)
+        if (effectiveTimeoutMs != options.quicConnectTimeoutMs) {
+            LKLog.w {
+                "[quic] Invalid connect timeout ${options.quicConnectTimeoutMs}ms; " +
+                    "using ${DEFAULT_QUIC_CONNECT_TIMEOUT_MS}ms."
+            }
+        }
+        LKLog.i {
+            "[quic] connect: alpn=${config.serverHost}, url=[$host], " +
+                "timeoutMs=$effectiveTimeoutMs, ${this@QuicTransport}"
+        }
+        this.connection?.connect(host, props, effectiveTimeoutMs)
     }
 
     override fun send(data: ByteString): Boolean {

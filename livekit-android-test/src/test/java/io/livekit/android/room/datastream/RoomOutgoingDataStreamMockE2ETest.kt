@@ -85,6 +85,7 @@ class RoomOutgoingDataStreamMockE2ETest : MockE2ETest() {
 
         with(headerPacket.streamHeader) {
             assertTrue(hasByteHeader())
+            assertEquals("stream_name", byteHeader.name)
         }
 
         val payloadPacket = LivekitModels.DataPacket.parseFrom(ByteString.copyFrom(buffers[1].data))

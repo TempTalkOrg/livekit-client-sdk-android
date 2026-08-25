@@ -121,6 +121,12 @@ constructor(
     internal val sender: RtpSender?
         get() = transceiver?.sender
 
+    /**
+     * The transceivers created for additional backup codecs (e.g. when using SVC with a backup codec).
+     */
+    internal val simulcastTransceivers: List<RtpTransceiver>
+        get() = simulcastCodecs.values.mapNotNull { it.transceiver }
+
     private val closeableManager = CloseableManager()
 
     /**
@@ -149,6 +155,7 @@ constructor(
     override fun dispose() {
         super.dispose()
         capturer.dispose()
+        source.dispose()
         closeableManager.close()
     }
 
@@ -320,7 +327,7 @@ constructor(
     }
 
     fun setCameraDeviceRotation(rotation: Int?) {
-        CameraCapturerUtils.setCameraDeviceRotation(context, capturer, rotation)
+        CameraCapturerUtils.getCameraProvider(context).setCameraDeviceRotation(capturer, rotation)
     }
 
     internal fun setPublishingLayers(
@@ -448,6 +455,15 @@ constructor(
         return simulcastTrackInfo
     }
 
+    /**
+     * Clears the backup codec state so it is re-established from scratch on the next publish,
+     * rather than reusing senders whose transceivers were stopped on unpublish.
+     */
+    internal fun clearSimulcastCodecs() {
+        subscribedCodecs = null
+        simulcastCodecs.clear()
+    }
+
     @AssistedFactory
     interface Factory {
         fun create(
@@ -555,5 +571,6 @@ internal data class SimulcastTrackInfo(
     var codec: String,
     var rtcTrack: MediaStreamTrack,
     var sender: RtpSender? = null,
+    var transceiver: RtpTransceiver? = null,
     var encodings: List<RtpParameters.Encoding>? = null,
 )

@@ -6,6 +6,8 @@ Supported platforms: Android (minimum API level 21)
 
 - Assemble: `./gradlew assemble`
 - Run tests: `./gradlew test`
+- Run detekt (static analysis): `./gradlew detektDebug`
+- Run detekt with baseline: `./gradlew detektRelease`
 - Install example app: `./gradlew sample-app-compose:installDebug`
 
 ## Architecture
@@ -81,10 +83,8 @@ This library makes extensive use of Dagger to provide dependency injection throu
 
 ## FlowObservable
 
-The SDK heavily relies on `@FlowObservable` class members, which allow them to be used as regular
-variables,
-while also allowing them to be observed as a `Flow`. This is especially useful for Android Compose
-projects,
+The SDK heavily relies on `@FlowObservable` class members, which allow them to be used as regular variables,
+while also allowing them to be observed as a `Flow`. This is especially useful for Android Compose projects,
 as this allows them to be converted to `State` objects and update the UI appropriately.
 
 ```kotlin
@@ -107,6 +107,10 @@ Unit tests are provided through the `livekit-android-test` module.
 
 - `io.livekit.android.test.mock` package - mocks and fakes
 - `MockE2ETest` - the base class for when testing `Room` behavior
+
+`livekit-android-test` is setup as a friend module to `livekit-android-sdk`, so that internal
+classes may be tested directly. However, avoid usage of internal methods for tests where possible
+in tests.
 
 ## Using Kotlin
 

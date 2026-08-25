@@ -23,6 +23,24 @@ class MockDataChannel(private val label: String?) : DataChannel(1L) {
     var observer: Observer? = null
     var sentBuffers = mutableListOf<Buffer>()
 
+    /** Snapshot of the bytes visible at send time, captured via the Buffer's current position/limit. */
+    var sentPayloads = mutableListOf<ByteArray>()
+    var sendResult = true
+
+    /**
+     * Optional synchronous callback invoked from inside [send] for every outgoing buffer.
+     * Useful for tests that need to inject incoming traffic while the sending coroutine is
+     * mid-flight (e.g. RPC v2 "response arrives during publish" scenarios).
+     */
+    var onSend: ((Buffer) -> Unit)? = null
+
+    /**
+     * When true, [send] advances the buffer's position to its limit, mirroring
+     * the real WebRTC wrapper which drains the buffer via `ByteBuffer.get(byte[])`.
+     * Off by default to keep existing tests that read from `sentBuffers` working.
+     */
+    var consumeSentBuffer = false
+
     private var stateBacking: State = State.OPEN
     var state: State
         get() {
@@ -57,6 +75,7 @@ class MockDataChannel(private val label: String?) : DataChannel(1L) {
 
     fun clearSentBuffers() {
         sentBuffers.clear()
+        sentPayloads.clear()
     }
 
     override fun registerObserver(observer: Observer?) {
@@ -92,7 +111,16 @@ class MockDataChannel(private val label: String?) : DataChannel(1L) {
     override fun send(buffer: Buffer): Boolean {
         ensureNotDisposed()
         sentBuffers.add(buffer)
-        return true
+        // Capture what native WebRTC would receive at this moment (position..limit).
+        val savedPos = buffer.data.position()
+        val payload = ByteArray(buffer.data.remaining())
+        buffer.data.get(payload)
+        sentPayloads.add(payload)
+        if (!consumeSentBuffer) {
+            buffer.data.position(savedPos)
+        }
+        onSend?.invoke(buffer)
+        return sendResult
     }
 
     override fun close() {

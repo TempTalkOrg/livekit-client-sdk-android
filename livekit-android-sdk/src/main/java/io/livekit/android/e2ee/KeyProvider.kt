@@ -91,7 +91,7 @@ class BaseKeyProvider(
      * @param keyIndex
      */
     override fun setKey(key: String, participantId: String?, keyIndex: Int?) {
-        setKeyInternal(key.toByteArray(), participantId, keyIndex)
+        setKey(key.toByteArray(), participantId, keyIndex)
     }
 
     /**
@@ -101,10 +101,6 @@ class BaseKeyProvider(
      * @param keyIndex
      */
     override fun setKey(key: ByteArray, participantId: String?, keyIndex: Int?) {
-        setKeyInternal(key, participantId, keyIndex)
-    }
-
-    private fun setKeyInternal(key: ByteArray, participantId: String?, keyIndex: Int?) {
         if (enableSharedKey) {
             return
         }

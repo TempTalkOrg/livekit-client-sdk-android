@@ -20,6 +20,7 @@ import io.livekit.android.room.ConnectionState
 import io.livekit.android.room.RTCEngine
 import io.livekit.android.room.Room
 import io.livekit.android.room.participant.Participant
+import io.livekit.android.util.rethrowIfCancellationSignal
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -86,7 +87,9 @@ private suspend fun collectPublisherMetrics(room: Room, rtcEngine: RTCEngine) {
             result.exceptionOrNull()?.let {
                 throw it
             }
-        } catch (ignored: Exception) {
+        } catch (e: Exception) {
+            e.rethrowIfCancellationSignal()
+            // LKLog.i(e) { "Error sending metrics: " }
         }
     }
 }
@@ -128,7 +131,9 @@ private suspend fun collectSubscriberMetrics(room: Room, rtcEngine: RTCEngine) {
             result.exceptionOrNull()?.let {
                 throw it
             }
-        } catch (ignored: Exception) {
+        } catch (e: Exception) {
+            e.rethrowIfCancellationSignal()
+            // LKLog.i(e) { "Error sending metrics: " }
         }
     }
 }

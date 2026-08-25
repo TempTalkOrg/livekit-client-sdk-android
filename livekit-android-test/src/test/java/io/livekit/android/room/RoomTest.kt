@@ -141,6 +141,14 @@ class RoomTest {
             connectionWarmer = MockConnectionWarmer(),
             audioRecordPrewarmer = NoAudioRecordPrewarmer(),
             incomingDataStreamManager = IncomingDataStreamManagerImpl(),
+            rpcClientManager = io.livekit.android.room.rpc.RpcClientManager(
+                engine = rtcEngine,
+                outgoingDataStreamManager = Mockito.mock(io.livekit.android.room.datastream.outgoing.OutgoingDataStreamManager::class.java),
+            ),
+            rpcServerManager = io.livekit.android.room.rpc.RpcServerManager(
+                engine = rtcEngine,
+                outgoingDataStreamManager = Mockito.mock(io.livekit.android.room.datastream.outgoing.OutgoingDataStreamManager::class.java),
+            ),
             remoteParticipantFactory = TestRemoteParticipantFactory(
                 rtcEngine = rtcEngine,
                 ioDispatcher = coroutineRule.dispatcher,

@@ -6,11 +6,12 @@ plugins {
 }
 
 // ---------------------------------------------------------------------------
-// Read local config from tt.json (gitignored).
-// Falls back to gradle.properties for each setting if tt.json is absent.
+// Read local config from local-config.json (gitignored).
+// Falls back to gradle.properties for each setting if local-config.json is absent.
 // ---------------------------------------------------------------------------
-def ttConfigFile = rootProject.file('local-config.json')
-def ttParsed = ttConfigFile.exists() ? new groovy.json.JsonSlurper().parse(ttConfigFile) : null
+def ttConfigFile = rootProject.layout.projectDirectory.file('local-config.json')
+def ttConfigText = providers.fileContents(ttConfigFile).asText.orNull
+def ttParsed = ttConfigText != null ? new groovy.json.JsonSlurper().parseText(ttConfigText) : null
 
 // Support both formats: bare array of presets (legacy) or { presets, settings }
 def ttPresets = (ttParsed instanceof List) ? ttParsed : (ttParsed?.presets ?: null)
@@ -163,5 +164,7 @@ dependencies {
 //    debugImplementation libs.leakcanary.android
 
     testImplementation libs.junit
+    testImplementation libs.androidx.test.core
+    testImplementation libs.robolectric
     androidTestImplementation libs.androidx.test.core
 }

@@ -64,10 +64,6 @@ object CameraCapturerUtils {
         return getCameraProvider(context).provideEnumerator(context)
     }
 
-    fun setCameraDeviceRotation(context: Context, capturer: VideoCapturer?, rotation: Int?) {
-        getCameraProvider(context).setCameraDeviceRotation(capturer, rotation)
-    }
-
     /**
      * Create a CameraProvider based on platform capabilities.
      *

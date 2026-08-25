@@ -42,4 +42,9 @@
 
 # Protobuf
 #########################################
--keep class * extends com.google.protobuf.GeneratedMessageLite { *; }
+-keepclassmembers class livekit.** extends com.google.protobuf.GeneratedMessageLite {
+  <fields>;
+}
+-keepclassmembers class com.google.protobuf.** extends com.google.protobuf.GeneratedMessageLite {
+  <fields>;
+}

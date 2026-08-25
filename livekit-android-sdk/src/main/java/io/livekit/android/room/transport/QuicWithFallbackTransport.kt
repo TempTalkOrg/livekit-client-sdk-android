@@ -198,11 +198,17 @@ class QuicWithFallbackTransport(
         } catch (e: Exception) {
             LKLog.w(e) { "[transport] quicTransport.cancel() threw while falling back" }
         }
+        val url = connectUrl
+        val token = connectToken
+        val options = connectOptions
+        if (url == null || token == null || options == null) {
+            LKLog.e { "[transport] cannot fall back to WebSocket: connect() parameters unavailable" }
+            outerListener?.onFailure(this, cause, null)
+            return
+        }
         val ws = WebSocketTransport(attemptId, sendOnOpen, okHttpClient)
         active = ws
-        val fallbackUrl = WebSocketUrlRewriter.rewriteIpUrlForWebSocket(connectUrl!!, connectOptions!!)
-        val token = connectToken!!
-        val options = connectOptions!!
+        val fallbackUrl = WebSocketUrlRewriter.rewriteIpUrlForWebSocket(url, options)
         postCallback {
             try {
                 LKLog.i { "[transport] starting WebSocket fallback connect url=$fallbackUrl" }

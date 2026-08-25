@@ -21,6 +21,7 @@ import android.app.Application
 import android.content.Intent
 import android.media.projection.MediaProjectionManager
 import android.os.Build
+import android.os.SystemClock
 import androidx.annotation.OptIn
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.lifecycle.AndroidViewModel
@@ -39,9 +40,11 @@ import io.livekit.android.audio.AudioSwitchHandler
 import io.livekit.android.e2ee.E2EEOptions
 import io.livekit.android.events.RoomEvent
 import io.livekit.android.events.collect
+import io.livekit.android.room.MediaSendConnectionState
 import io.livekit.android.room.Room
 import io.livekit.android.room.datastream.StreamTextOptions
 import io.livekit.android.room.datastream.incoming.TextStreamReceiver
+import io.livekit.android.room.participant.ConnectionQuality
 import io.livekit.android.room.participant.LocalParticipant
 import io.livekit.android.room.participant.Participant
 import io.livekit.android.room.participant.RemoteParticipant
@@ -57,6 +60,7 @@ import io.livekit.android.room.track.VideoCodec
 import io.livekit.android.room.track.VideoPreset169
 import io.livekit.android.room.track.screencapture.ScreenCaptureParams
 import io.livekit.android.room.track.video.CameraCapturerUtils
+import io.livekit.android.rpc.RpcError
 import io.livekit.android.sample.common.BuildConfig
 import io.livekit.android.sample.model.StressTest
 import io.livekit.android.sample.proxy.ProxyConfig
@@ -64,6 +68,7 @@ import io.livekit.android.sample.service.ForegroundService
 import io.livekit.android.util.LKLog
 import io.livekit.android.util.flow
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -121,6 +126,25 @@ data class MergeStartCallParam(
     val userAgent: String,
 )
 
+enum class MediaSendUiState {
+    NONE,
+    ROOM_RECOVERING,
+    MEDIA_RECOVERING,
+}
+
+fun resolveMediaSendUiState(
+    roomState: Room.State,
+    mediaSendState: MediaSendConnectionState,
+): MediaSendUiState = when {
+    roomState == Room.State.DISCONNECTED -> MediaSendUiState.NONE
+    roomState == Room.State.RECONNECTING ||
+        mediaSendState == MediaSendConnectionState.ROOM_RECOVERING -> MediaSendUiState.ROOM_RECOVERING
+    roomState != Room.State.CONNECTED -> MediaSendUiState.NONE
+    mediaSendState == MediaSendConnectionState.RECOVERING ||
+        mediaSendState == MediaSendConnectionState.FAILED -> MediaSendUiState.MEDIA_RECOVERING
+    else -> MediaSendUiState.NONE
+}
+
 @OptIn(ExperimentalCamera2Interop::class)
 class CallViewModel(
     val url: String,
@@ -136,12 +160,14 @@ class CallViewModel(
     val proxyConfig: ProxyConfig? = null,
     val audioProcessorOptions: AudioProcessorOptions? = null,
     val stressTest: StressTest = StressTest.None,
+    val quicConnectTimeoutMs: Int = DEFAULT_QUIC_CONNECT_TIMEOUT_MS,
 ) : AndroidViewModel(application) {
 
     private fun getE2EEOptions(): E2EEOptions? {
-        var e2eeOptions: E2EEOptions? = null
-        if (e2ee && e2eeKey != null) {
-            e2eeOptions = E2EEOptions()
+        var e2eeOptions = if (e2ee && e2eeKey != null) {
+            E2EEOptions()
+        } else {
+            null
         }
         if (!BuildConfig.USE_MERGE_START_CALL) {
             e2eeOptions?.keyProvider?.setSharedKey(e2eeKey!!)
@@ -177,7 +203,7 @@ class CallViewModel(
                 quicProxyPort = quicProxyPort,
                 quicProxySni = quicProxySni,
                 quicProxySpkiPin = quicProxySpkiPin,
-            )
+            ).withQuicConnectTimeout(quicConnectTimeoutMs)
         }
         val param = Json.decodeFromString<MergeStartCallParam>(BuildConfig.MERGE_START_CALL_PARAM)
 
@@ -233,7 +259,7 @@ class CallViewModel(
             quicProxyPort = quicProxyPort,
             quicProxySni = quicProxySni,
             quicProxySpkiPin = quicProxySpkiPin,
-        )
+        ).withQuicConnectTimeout(quicConnectTimeoutMs)
     }
 
     private fun getRoomOptions(): RoomOptions {
@@ -286,6 +312,58 @@ class CallViewModel(
     private var cameraProvider: CameraCapturerUtils.CameraProvider? = null
     val audioHandler = room.audioHandler as AudioSwitchHandler
 
+    // 1v1 入会计时探针：记录本端 connected / 对端加入的时刻，用于观测各阶段时间差
+    private var callTimingConnectedAtMs = 0L
+    private var callTimingRemoteJoinedAtMs = 0L
+
+    /** 三端统一日志格式，方便直接比对各阶段时间差。 */
+    private fun logCallTiming(stage: String, extra: String = "") {
+        val now = SystemClock.elapsedRealtime()
+        val sinceConnected = if (callTimingConnectedAtMs > 0) now - callTimingConnectedAtMs else -1
+        val sinceRemoteJoined = if (callTimingRemoteJoinedAtMs > 0) now - callTimingRemoteJoinedAtMs else -1
+        LKLog.i { "[1v1Timing] stage=$stage sinceConnected=${sinceConnected}ms sinceRemoteJoined=${sinceRemoteJoined}ms$extra" }
+    }
+
+    // 媒体就绪探针：本端麦克风轨道被订阅即视为就绪。
+    // 若订阅信号缺失，则保留超时兜底，避免永远等不到就绪。
+    private var micTrackSubscribed = false
+    private var mediaReadyReported = false
+    private var mediaReadyFallbackJob: Job? = null
+
+    /** 对端进房时装载，避免订阅信号缺失时永远等不到就绪。 */
+    private fun armMediaReadyGate() {
+        if (mediaReadyReported || mediaReadyFallbackJob != null) return
+        mediaReadyFallbackJob = viewModelScope.launch {
+            delay(MEDIA_READY_FALLBACK_MS)
+            reportMediaReady("fallbackTimeout")
+        }
+    }
+
+    private fun onMicTrackSubscribed() {
+        if (micTrackSubscribed) return
+        micTrackSubscribed = true
+        reportMediaReady("trackSubscribed")
+    }
+
+    /** 幂等：一次会话只报一次，重连不重报。 */
+    private fun reportMediaReady(reason: String) {
+        if (mediaReadyReported) return
+        mediaReadyReported = true
+        mediaReadyFallbackJob?.cancel()
+        mediaReadyFallbackJob = null
+        logCallTiming(
+            "mediaReady",
+            " reason=$reason micTrackSubscribed=$micTrackSubscribed",
+        )
+    }
+
+    private fun resetMediaReadyGate() {
+        mediaReadyFallbackJob?.cancel()
+        mediaReadyFallbackJob = null
+        micTrackSubscribed = false
+        mediaReadyReported = false
+    }
+
     val participants = room::remoteParticipants.flow
         .map { remoteParticipants ->
             listOf<Participant>(room.localParticipant) +
@@ -300,6 +378,9 @@ class CallViewModel(
 
     private val mutableConnectionStatus = MutableStateFlow("Connecting")
     val connectionStatus = mutableConnectionStatus.hide()
+
+    private val mutableMediaSendUiState = MutableStateFlow(MediaSendUiState.NONE)
+    val mediaSendUiState = mutableMediaSendUiState.hide()
 
     private val mutablePrimarySpeaker = MutableStateFlow<Participant?>(null)
     val primarySpeaker: StateFlow<Participant?> = mutablePrimarySpeaker
@@ -328,12 +409,27 @@ class CallViewModel(
     private val mutablePermissionAllowed = MutableStateFlow(true)
     val permissionAllowed = mutablePermissionAllowed.hide()
 
+    // RPC tester state. Lives on the ViewModel so it survives dialog dismiss/reopen.
+    private val mutableHandlers = MutableStateFlow<List<RpcHandlerState>>(emptyList())
+    val handlers: StateFlow<List<RpcHandlerState>> = mutableHandlers
+
     init {
 
         CameraXHelper.createCameraProvider(ProcessLifecycleOwner.get()).let {
             if (it.isSupported(application)) {
                 CameraCapturerUtils.registerCameraProvider(it)
                 cameraProvider = it
+            }
+        }
+
+        viewModelScope.launch {
+            combine(
+                room::state.flow,
+                room::mediaSendConnectionState.flow,
+            ) { roomState, mediaSendState ->
+                roomState to mediaSendState
+            }.collect { (roomState, mediaSendState) ->
+                mutableMediaSendUiState.value = resolveMediaSendUiState(roomState, mediaSendState)
             }
         }
 
@@ -384,6 +480,24 @@ class CallViewModel(
                         }
                         is RoomEvent.Connected -> {
                             mutableConnectionStatus.value = "Connected"
+
+                            callTimingConnectedAtMs = SystemClock.elapsedRealtime()
+                            callTimingRemoteJoinedAtMs = 0L
+                            resetMediaReadyGate()
+                            logCallTiming("roomConnected", " remoteCount=${room.remoteParticipants.size}")
+
+                            // 后加入方在 connected 时对端就已在房间里，不会再收到 ParticipantConnected
+                            room.remoteParticipants.values.firstOrNull()?.let { remote ->
+                                callTimingRemoteJoinedAtMs = callTimingConnectedAtMs
+                                logCallTiming(
+                                    "remoteAlreadyPresent",
+                                    " identity=${remote.identity} alreadyActive=${remote.state == Participant.State.ACTIVE}",
+                                )
+                                armMediaReadyGate()
+                            }
+                        }
+                        is RoomEvent.MediaSendConnectionStateChanged -> {
+                            LKLog.i { "mediaSendConnectionState ${it.oldState} -> ${it.state}" }
                         }
                         is RoomEvent.DataReceived -> {
                             // Handling basic data packets.
@@ -396,6 +510,7 @@ class CallViewModel(
                         is RoomEvent.Disconnected -> {
                             LKLog.e(it.error) { "Disconnected reason:${it.reason}" }
                             mutableConnectionStatus.value = "Disconnected (${it.reason})"
+                            resetMediaReadyGate()
                         }
 
                         is RoomEvent.Reconnecting -> {
@@ -408,12 +523,42 @@ class CallViewModel(
                             mutableConnectionStatus.value = "Reconnected"
                         }
 
+                        is RoomEvent.ConnectionQualityChanged -> {
+                            logConnectionQuality(it.participant, it.quality)
+                        }
+
                         is RoomEvent.ParticipantDisconnected -> {
                             LKLog.i { "ParticipantDisconnected: ${it.participant.identity} ${it.participant.sid}" }
                         }
 
                         is RoomEvent.ParticipantConnected -> {
                             LKLog.i { "ParticipantConnected: ${it.participant.identity} ${it.participant.sid}" }
+
+                            if (callTimingRemoteJoinedAtMs == 0L) {
+                                callTimingRemoteJoinedAtMs = SystemClock.elapsedRealtime()
+                            }
+                            logCallTiming("remoteJoined", " identity=${it.participant.identity}")
+                            armMediaReadyGate()
+                        }
+
+                        is RoomEvent.ParticipantStateChanged -> {
+                            if (it.participant is RemoteParticipant) {
+                                val stage = if (it.newState == Participant.State.ACTIVE) {
+                                    "participantActive"
+                                } else {
+                                    "participantState"
+                                }
+                                logCallTiming(stage, " identity=${it.participant.identity} state=${it.newState}")
+                            }
+                        }
+
+                        is RoomEvent.LocalTrackSubscribed -> {
+                            logCallTiming(
+                                "localTrackSubscribed",
+                                " source=${it.publication.source} sid=${it.publication.sid}",
+                            )
+                            // 只有麦克风轨道被订阅才算；摄像头/屏共被订阅与「能否听见我」无关。
+                            if (it.publication.source == Track.Source.MICROPHONE) onMicTrackSubscribed()
                         }
 
                         is RoomEvent.TrackMuted -> {
@@ -467,6 +612,13 @@ class CallViewModel(
         } else {
             application.startService(foregroundServiceIntent)
         }
+    }
+
+    /** demo 不做归一化，原样记录 SDK 上报的档位即可。 */
+    private fun logConnectionQuality(participant: Participant, quality: ConnectionQuality) {
+        val identity = participant.identity?.value ?: participant.sid.value
+        val isLocal = participant === room.localParticipant
+        LKLog.i { "[nq] identity=$identity local=$isLocal quality=${quality.name.lowercase()}" }
     }
 
     private suspend fun collectTrackStats(event: RoomEvent.TrackSubscribed) {
@@ -605,6 +757,12 @@ class CallViewModel(
     override fun onCleared() {
         super.onCleared()
 
+        // Tear down any RPC handlers before releasing the room.
+        mutableHandlers.value.forEach { handler ->
+            runCatching { room.localParticipant.unregisterRpcMethod(handler.method) }
+        }
+        mutableHandlers.value = emptyList()
+
         // Make sure to release any resources associated with LiveKit
         room.disconnect()
         room.release()
@@ -664,6 +822,51 @@ class CallViewModel(
     fun sendData(message: String) {
         viewModelScope.launch(Dispatchers.IO) {
             room.localParticipant.sendText(message, StreamTextOptions(topic = "lk.chat"))
+        }
+    }
+
+    fun registerRpcHandler(method: String, initialResponse: String) {
+        if (method.isBlank()) return
+        val state = RpcHandlerState(
+            method = method,
+            staticResponse = MutableStateFlow(initialResponse),
+            invocations = MutableStateFlow(emptyList()),
+        )
+        room.localParticipant.registerRpcMethod(method) { invocation ->
+            val record = RpcInvocationRecord(
+                timestamp = System.currentTimeMillis(),
+                caller = invocation.callerIdentity,
+                payload = invocation.payload,
+            )
+            state.invocations.value = state.invocations.value + record
+            state.staticResponse.value
+        }
+        // Replace any prior entry for the same method (SDK overwrites anyway).
+        mutableHandlers.value = mutableHandlers.value.filterNot { it.method == method } + state
+    }
+
+    fun unregisterRpcHandler(method: String) {
+        room.localParticipant.unregisterRpcMethod(method)
+        mutableHandlers.value = mutableHandlers.value.filterNot { it.method == method }
+    }
+
+    fun updateStaticResponse(method: String, response: String) {
+        mutableHandlers.value.firstOrNull { it.method == method }
+            ?.staticResponse?.let { it.value = response }
+    }
+
+    suspend fun performRpc(
+        destination: Participant.Identity,
+        method: String,
+        payload: String,
+    ): RpcRequestResult {
+        return try {
+            val response = room.localParticipant.performRpc(destination, method, payload)
+            RpcRequestResult.Success(response)
+        } catch (e: RpcError) {
+            RpcRequestResult.Error(e.code, e.message)
+        } catch (e: Throwable) {
+            RpcRequestResult.Error(null, e.message ?: e.toString())
         }
     }
 
@@ -749,3 +952,23 @@ class CallViewModel(
 
 private fun <T> LiveData<T>.hide(): LiveData<T> = this
 private fun <T> MutableStateFlow<T>.hide(): StateFlow<T> = this
+
+/** 麦克风轨道订阅信号缺失时的兜底时长。 */
+private const val MEDIA_READY_FALLBACK_MS = 5_000L
+
+data class RpcInvocationRecord(
+    val timestamp: Long,
+    val caller: Participant.Identity,
+    val payload: String,
+)
+
+class RpcHandlerState(
+    val method: String,
+    val staticResponse: MutableStateFlow<String>,
+    val invocations: MutableStateFlow<List<RpcInvocationRecord>>,
+)
+
+sealed class RpcRequestResult {
+    data class Success(val response: String) : RpcRequestResult()
+    data class Error(val code: Int?, val message: String) : RpcRequestResult()
+}

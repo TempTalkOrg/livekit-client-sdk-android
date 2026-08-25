@@ -19,6 +19,7 @@ package io.livekit.android.sample
 import android.content.Intent
 import android.os.Bundle
 import android.text.SpannableStringBuilder
+import android.view.View
 import android.widget.ArrayAdapter
 import android.widget.Toast
 import androidx.activity.viewModels
@@ -61,13 +62,24 @@ class MainActivity : AppCompatActivity() {
         val e2EEKey = viewModel.getSavedE2EEKey()
         val savedQuicDeviceType = viewModel.getQuicDeviceType()
         val savedQuicCidTag = viewModel.getQuicCidTag()
+        val savedQuicConnectTimeoutMs = viewModel.getQuicConnectTimeoutMs()
 
         binding.run {
             e2eeEnabled.isChecked = e2EEOn
             e2eeKey.editText?.text = SpannableStringBuilder(e2EEKey)
             quicEnabled.isChecked = selectedPreset.useQuicSignal
+            quicConnectTimeout.editText?.text = SpannableStringBuilder(savedQuicConnectTimeoutMs.toString())
             quicDeviceType.editText?.text = SpannableStringBuilder(savedQuicDeviceType.toString())
             quicCidTag.editText?.text = SpannableStringBuilder(savedQuicCidTag)
+
+            fun updateQuicConnectTimeoutVisibility(enabled: Boolean) {
+                quicConnectTimeout.visibility = if (enabled) View.VISIBLE else View.GONE
+            }
+
+            updateQuicConnectTimeoutVisibility(quicEnabled.isChecked)
+            quicEnabled.setOnCheckedChangeListener { _, isChecked ->
+                updateQuicConnectTimeoutVisibility(isChecked)
+            }
 
             presetDropdown.setOnItemClickListener { _, _, position, _ ->
                 val preset = presets[position]
@@ -81,6 +93,19 @@ class MainActivity : AppCompatActivity() {
                     quicDeviceType.editText?.text?.toString()?.toIntOrNull()
                         ?: MainViewModel.DEFAULT_QUIC_DEVICE_TYPE
                 val quicCidTagStr = quicCidTag.editText?.text?.toString().orEmpty()
+                val quicConnectTimeoutMs = if (quicEnabled.isChecked) {
+                    val parsed = parseQuicConnectTimeoutMs(quicConnectTimeout.editText?.text?.toString().orEmpty())
+                    if (parsed == null) {
+                        quicConnectTimeout.error = QUIC_CONNECT_TIMEOUT_ERROR
+                        return@setOnClickListener
+                    }
+                    quicConnectTimeout.error = null
+                    viewModel.setQuicConnectTimeoutMs(parsed)
+                    parsed
+                } else {
+                    quicConnectTimeout.error = null
+                    DEFAULT_QUIC_CONNECT_TIMEOUT_MS
+                }
                 val proxy = selectedProxy()
                 val intent = Intent(this@MainActivity, CallActivity::class.java).apply {
                     putExtra(
@@ -93,6 +118,7 @@ class MainActivity : AppCompatActivity() {
                             quicOn = quicEnabled.isChecked,
                             quicDeviceType = quicDeviceTypeInt,
                             quicCidTag = quicCidTagStr,
+                            quicConnectTimeoutMs = quicConnectTimeoutMs,
                             serverHost = preset.serverHost,
                             caCertPem = preset.caCertPem,
                             proxyEnabled = proxy != null,
@@ -122,6 +148,8 @@ class MainActivity : AppCompatActivity() {
                         ?: MainViewModel.DEFAULT_QUIC_DEVICE_TYPE,
                 )
                 viewModel.setQuicCidTag(quicCidTag.editText?.text?.toString().orEmpty())
+                parseQuicConnectTimeoutMs(quicConnectTimeout.editText?.text?.toString().orEmpty())
+                    ?.let(viewModel::setQuicConnectTimeoutMs)
                 viewModel.setSavedProxyId(selectedProxy()?.id ?: MainViewModel.PROXY_ID_NONE)
 
                 Toast.makeText(
@@ -141,6 +169,9 @@ class MainActivity : AppCompatActivity() {
                 quicDeviceType.editText?.text =
                     SpannableStringBuilder(MainViewModel.DEFAULT_QUIC_DEVICE_TYPE.toString())
                 quicCidTag.editText?.text = SpannableStringBuilder(MainViewModel.DEFAULT_QUIC_CID_TAG)
+                quicConnectTimeout.editText?.text =
+                    SpannableStringBuilder(DEFAULT_QUIC_CONNECT_TIMEOUT_MS.toString())
+                quicConnectTimeout.error = null
                 rtcProxyDropdown.setText(MainViewModel.PROXY_LABEL_NONE, false)
 
                 Toast.makeText(
@@ -154,5 +185,9 @@ class MainActivity : AppCompatActivity() {
         setContentView(binding.root)
 
         requestNeededPermissions()
+    }
+
+    private companion object {
+        const val QUIC_CONNECT_TIMEOUT_ERROR = "Enter an integer from 1000 to 15000 ms"
     }
 }

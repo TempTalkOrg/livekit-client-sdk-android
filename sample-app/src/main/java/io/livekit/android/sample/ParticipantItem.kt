@@ -121,8 +121,8 @@ class ParticipantItem(
         coroutineScope?.launch {
             participant::connectionQuality.flow
                 .collect { quality ->
-                    viewBinding.connectionQuality.visibility =
-                        if (quality == ConnectionQuality.POOR) View.VISIBLE else View.INVISIBLE
+                    viewBinding.connectionQuality.text = quality.name
+                    viewBinding.connectionQuality.setTextColor(quality.labelColor)
                 }
         }
 
@@ -246,6 +246,16 @@ private data class VideoPublications(
     val screenShare: TrackPublication?,
     val camera: TrackPublication?,
 )
+
+/** 五档五色，lost 和 unknown 也要有自己的颜色，否则最该看到的那两档反而看不出来。 */
+private val ConnectionQuality.labelColor: Int
+    get() = when (this) {
+        ConnectionQuality.EXCELLENT -> 0xFF69DB7C.toInt()
+        ConnectionQuality.GOOD -> 0xFFFFD43B.toInt()
+        ConnectionQuality.POOR -> 0xFFFF8787.toInt()
+        ConnectionQuality.LOST -> 0xFFDA77F2.toInt()
+        ConnectionQuality.UNKNOWN -> 0xFFCED4DA.toInt()
+    }
 
 private fun View.visibleOrGone(visible: Boolean) {
     visibility = if (visible) {

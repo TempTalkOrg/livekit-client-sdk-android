@@ -62,7 +62,11 @@ import io.livekit.android.room.participant.RpcHandler
 import io.livekit.android.room.participant.VideoTrackPublishDefaults
 import io.livekit.android.room.participant.publishTracksInfo
 import io.livekit.android.room.provisions.LKObjects
+import io.livekit.android.room.rpc.RPC_REQUEST_DATA_STREAM_TOPIC
+import io.livekit.android.room.rpc.RPC_RESPONSE_DATA_STREAM_TOPIC
+import io.livekit.android.room.rpc.RpcClientManager
 import io.livekit.android.room.rpc.RpcManager
+import io.livekit.android.room.rpc.RpcServerManager
 import io.livekit.android.room.track.LocalAudioTrackOptions
 import io.livekit.android.room.track.LocalTrackPublication
 import io.livekit.android.room.track.LocalVideoTrackOptions
@@ -76,6 +80,7 @@ import io.livekit.android.util.LKLog
 import io.livekit.android.util.flow
 import io.livekit.android.util.flowDelegate
 import io.livekit.android.util.invoke
+import io.livekit.android.util.rethrowIfCancellationSignal
 import io.livekit.android.webrtc.getFilteredStats
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
@@ -87,6 +92,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.job
@@ -158,6 +164,8 @@ constructor(
     private val connectionWarmer: ConnectionWarmer,
     private val audioRecordPrewarmer: AudioRecordPrewarmer,
     private val incomingDataStreamManager: IncomingDataStreamManager,
+    private val rpcClientManager: RpcClientManager,
+    private val rpcServerManager: RpcServerManager,
     private val remoteParticipantFactory: RemoteParticipant.Factory,
 ) : RTCEngine.Listener, ParticipantListener, RpcManager, IncomingDataStreamManager by incomingDataStreamManager {
 
@@ -167,6 +175,27 @@ constructor(
 
     init {
         engine.listener = this
+
+        // Register SDK-internal text-stream handlers for the RPC v2 transport. These reserve
+        // the topics `lk.rpc_request` and `lk.rpc_response` from user-level handler registration.
+        incomingDataStreamManager.registerTextStreamHandler(RPC_REQUEST_DATA_STREAM_TOPIC) { receiver, fromIdentity ->
+            coroutineScope.launch {
+                rpcServerManager.handleIncomingDataStream(receiver, fromIdentity)
+            }
+        }
+        incomingDataStreamManager.registerTextStreamHandler(RPC_RESPONSE_DATA_STREAM_TOPIC) { receiver, fromIdentity ->
+            coroutineScope.launch {
+                rpcClientManager.handleIncomingDataStreamResponse(receiver, fromIdentity)
+            }
+        }
+
+        // Wire each manager's clientProtocol lookup via the remote-participants store.
+        val getRemoteClientProtocol: (Participant.Identity) -> Int = { id ->
+            remoteParticipants[id]?.clientProtocol
+                ?: ClientProtocolVersion.DEFAULT.value
+        }
+        rpcClientManager.getRemoteClientProtocol = getRemoteClientProtocol
+        rpcServerManager.getRemoteClientProtocol = getRemoteClientProtocol
     }
 
     enum class State {
@@ -248,6 +277,19 @@ constructor(
             }
         }
     }
+        private set
+
+    /**
+     * Health of the local media send (uplink) path.
+     *
+     * Distinct from [state] when the server uses `subscriberPrimary`: the room may
+     * report [State.CONNECTED] while local audio/video cannot be sent.
+     *
+     * @see RoomEvent.MediaSendConnectionStateChanged
+     */
+    @FlowObservable
+    @get:FlowObservable
+    var mediaSendConnectionState: MediaSendConnectionState by flowDelegate(MediaSendConnectionState.IDLE)
         private set
 
     @FlowObservable
@@ -381,7 +423,7 @@ constructor(
     val serverInfo: ServerInfo?
         get() = engine.serverInfo
 
-    private var sidToIdentity = mutableMapOf<Participant.Sid, Participant.Identity>()
+    private val sidToIdentity = mutableMapOf<Participant.Sid, Participant.Identity>()
 
     /**
      * Pending delayed removals for remote participants that disconnected for a
@@ -406,6 +448,18 @@ constructor(
     @Volatile
     private var activeNetwork: Network? = null
 
+    private val mediaSendStateLock = Any()
+    private val wholeConnectionRecoveryReducer = WholeConnectionRecoveryReducer()
+    private var mediaSendNetworkState = MediaSendNetworkState.UNKNOWN
+
+    /**
+     * Whether the room's primary connection is in a recovery window.
+     */
+    @FlowObservable
+    @get:FlowObservable
+    internal var isWholeConnectionRecovering: Boolean by flowDelegate(false)
+        private set
+
     @Volatile
     private var pendingRestartNetwork: Network? = null
 
@@ -416,7 +470,7 @@ constructor(
     private var regionUrlProvider: RegionUrlProvider? = null
     private var regionUrl: String? = null
 
-    private var transcriptionReceivedTimes = mutableMapOf<String, Long>()
+    private val transcriptionReceivedTimes = mutableMapOf<String, Long>()
 
     internal var isPrerecording by defaultsManager::isPrerecording
 
@@ -467,6 +521,7 @@ constructor(
                 connectionWarmer.fetch(url)
             }
         } catch (e: Exception) {
+            e.rethrowIfCancellationSignal()
             LKLog.e(e) { "Error while preparing connection:" }
         }
     }
@@ -505,8 +560,9 @@ constructor(
             roomOptions = getCurrentRoomOptions()
 
             // Setup local participant.
-            localParticipant.reinitialize()
+            localParticipant.reinitialize(options)
             setupLocalParticipantEventHandling()
+            setupMediaSendConnectionStateObservation()
 
             if (roomOptions.e2eeOptions != null) {
                 e2eeManager = e2EEManagerFactory.create(roomOptions.e2eeOptions.keyProvider).apply {
@@ -551,6 +607,7 @@ constructor(
                     try {
                         regionUrlProvider?.fetchRegionSettings()
                     } catch (e: Exception) {
+                        e.rethrowIfCancellationSignal()
                         LKLog.w(e) { "could not fetch region settings" }
                     }
                 }
@@ -566,9 +623,7 @@ constructor(
                     engine.regionUrlProvider = regionUrlProvider
                     engine.join(connectUrl, token, options, roomOptions)
                 } catch (e: Exception) {
-                    if (e is CancellationException) {
-                        throw e // rethrow to properly cancel.
-                    }
+                    e.rethrowIfCancellationSignal()
 
                     nextUrl = regionUrlProvider?.getNextBestRegionUrl()
                     if (nextUrl != null) {
@@ -582,27 +637,21 @@ constructor(
             ensureActive()
             networkCallbackManager.registerCallback()
             if (options.audio) {
-                val audioTrack = localParticipant.getOrCreateDefaultAudioTrack()
-                audioTrack.prewarm()
                 var cancelPreconnect: (() -> Unit)? = null
 
                 if (audioTrackPublishDefaults.preconnect) {
                     cancelPreconnect = startPreconnectAudioJob(roomScope = coroutineScope)
                 }
-                if (!localParticipant.publishAudioTrack(audioTrack)) {
-                    audioTrack.stop()
-                    audioTrack.stopPrewarm()
+                // Enable through setMicrophoneEnabled rather than publishing directly,
+                // so that this serializes with any concurrent enable calls from the app
+                // once the room state flips to CONNECTED.
+                if (!localParticipant.setMicrophoneEnabled(true)) {
                     cancelPreconnect?.invoke()
                 }
             }
             ensureActive()
             if (options.video) {
-                val videoTrack = localParticipant.getOrCreateDefaultVideoTrack()
-                videoTrack.startCapture()
-                if (!localParticipant.publishVideoTrack(videoTrack)) {
-                    videoTrack.stopCapture()
-                    videoTrack.stop()
-                }
+                localParticipant.setCameraEnabled(true)
             }
 
             coroutineScope.launch {
@@ -777,6 +826,95 @@ constructor(
         }
     }
 
+    private fun setupMediaSendConnectionStateObservation() {
+        coroutineScope.launch {
+            val publisherHealthChanges = combine(
+                engine::publisherConnectionState.flow,
+                engine::hasPublisherEverConnected.flow,
+            ) { _, _ -> Unit }
+            combine(
+                this@Room::state.flow,
+                engine::connectionState.flow,
+                engine::hasPublished.flow,
+                engine::isSubscriberPrimary.flow,
+                publisherHealthChanges,
+            ) { _, _, _, _, _ -> Unit }
+                .collect {
+                    updateMediaSendConnectionState()
+                }
+        }
+    }
+
+    private fun updateMediaSendConnectionState() {
+        synchronized(mediaSendStateLock) {
+            updateMediaSendConnectionStateLocked()
+        }
+    }
+
+    private fun updateMediaSendConnectionStateLocked() {
+        val roomState = state
+        val engineState = engine.connectionState
+        val hasPublished = engine.hasPublished
+        val publisherConnectionState = engine.publisherConnectionState
+        val wholeConnectionRecovering = wholeConnectionRecoveryReducer.reduce(
+            WholeConnectionRecoveryInput(
+                roomState = roomState,
+                engineState = engineState,
+                hasPublished = hasPublished,
+                publisherConnectionState = publisherConnectionState,
+                networkState = mediaSendNetworkState,
+            ),
+        )
+        isWholeConnectionRecovering = wholeConnectionRecovering
+
+        val computed = MediaSendConnectionState.computeFull(
+            roomState = roomState,
+            subscriberPrimary = engine.isSubscriberPrimary,
+            hasPublished = hasPublished,
+            isResumingOrReconnecting =
+            engineState == ConnectionState.RECONNECTING ||
+                engineState == ConnectionState.RESUMING ||
+                roomState == State.RECONNECTING,
+            publisherConnectionState = publisherConnectionState,
+            isWholeConnectionRecovering = wholeConnectionRecovering,
+            hasPublisherEverConnected = engine.hasPublisherEverConnected,
+        )
+        applyMediaSendConnectionState(computed)
+    }
+
+    private fun updateMediaSendNetworkState(networkState: MediaSendNetworkState) {
+        synchronized(mediaSendStateLock) {
+            mediaSendNetworkState = networkState
+            updateMediaSendConnectionStateLocked()
+        }
+    }
+
+    private fun resetMediaSendConnectionState() {
+        synchronized(mediaSendStateLock) {
+            mediaSendNetworkState = MediaSendNetworkState.UNKNOWN
+            wholeConnectionRecoveryReducer.reset()
+            isWholeConnectionRecovering = false
+            applyMediaSendConnectionState(MediaSendConnectionState.IDLE)
+        }
+    }
+
+    private fun applyMediaSendConnectionState(computed: MediaSendConnectionState) {
+        applyMediaSendConnectionStateTransition(
+            current = mediaSendConnectionState,
+            next = computed,
+            updateState = { new ->
+                val old = mediaSendConnectionState
+                mediaSendConnectionState = new
+                LKLog.i { "mediaSendConnectionState: $old -> $new" }
+            },
+            emitEvent = { new, old ->
+                eventBus.tryPostEvent(
+                    RoomEvent.MediaSendConnectionStateChanged(this, new, old),
+                )
+            },
+        )
+    }
+
     private fun setupLocalParticipantEventHandling() {
         coroutineScope.launch {
             localParticipant.events.collect {
@@ -949,10 +1087,12 @@ constructor(
     ): RemoteParticipant {
         var participant = remoteParticipants[identity]
         if (participant != null) {
+            val previousSid = participant.sid
             val wasUpdated = participant.updateFromInfo(info)
             if (wasUpdated) {
                 sidToIdentity[participant.sid] = identity
             }
+            resetConnectionQualityIfNewSession(participant, previousSid)
 
             return participant
         }
@@ -1127,6 +1267,7 @@ constructor(
         }
         if (activeNetwork == null) {
             LKLog.i { "[reconnect][net] reconnect deferred: no active network, reason=$reason" }
+            updateMediaSendConnectionState()
             return
         }
         engine.reconnect(networkHandle, reason)
@@ -1146,6 +1287,7 @@ constructor(
                 pendingRestartNetwork = null
 
                 state = State.DISCONNECTED
+                resetMediaSendConnectionState()
                 cleanupRoom()
                 engine.close()
 
@@ -1284,6 +1426,7 @@ constructor(
                     pendingRestartNetwork = network
                     LKLog.i { "[reconnect][net] network changed, waiting for readiness, network=$network" }
                 }
+                updateMediaSendNetworkState(MediaSendNetworkState.AVAILABLE)
             }
 
             override fun onLost(network: Network) {
@@ -1292,12 +1435,14 @@ constructor(
                 if (network == activeNetwork) {
                     activeNetwork = null
                     pendingRestartNetwork = null
+                    updateMediaSendNetworkState(MediaSendNetworkState.UNAVAILABLE)
                 }
             }
 
             override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
                 LKLog.d { "[reconnect][net] onCapabilitiesChanged, network=$network, pendingRestartNetwork=$pendingRestartNetwork, caps=$caps" }
                 activeNetwork = network
+                updateMediaSendNetworkState(MediaSendNetworkState.AVAILABLE)
 
                 if (network != pendingRestartNetwork) {
                     return
@@ -1327,8 +1472,8 @@ constructor(
         localParticipant.unregisterRpcMethod(method)
     }
 
-    override suspend fun performRpc(destinationIdentity: Participant.Identity, method: String, payload: String, responseTimeout: Duration): String {
-        return localParticipant.performRpc(destinationIdentity, method, payload, responseTimeout)
+    override suspend fun performRpc(destinationIdentity: Participant.Identity, method: String, payload: String, responseTimeout: Duration, maxRoundTripLatency: Duration): String {
+        return localParticipant.performRpc(destinationIdentity, method, payload, responseTimeout, maxRoundTripLatency)
     }
 
     // ----------------------------------- RTCEngine.Listener ------------------------------------//
@@ -1413,7 +1558,7 @@ constructor(
      */
     private fun detachRtcTrackFromOtherParticipants(rtcTrack: MediaStreamTrack, newParticipantSid: String) {
         for ((_, participant) in remoteParticipants) {
-            if (participant.sid?.value == newParticipantSid) continue
+            if (participant.sid.value == newParticipantSid) continue
             for ((_, publication) in participant.trackPublications) {
                 val existingTrack = publication.track ?: continue
                 if (existingTrack.rtcTrack === rtcTrack) {
@@ -1514,6 +1659,26 @@ constructor(
         if (oldIsRecording != isRecording) {
             eventBus.postEvent(RoomEvent.RecordingStatusChanged(this, isRecording), coroutineScope)
         }
+    }
+
+    /**
+     * Connection quality is measured per session, so a new sid means the previous reading no
+     * longer describes the current connection. It has to be dropped because the server only
+     * sends quality for participants we hold a track subscription to: a peer that reconnects
+     * without publishing would otherwise keep its stale pre-reconnect quality forever.
+     */
+    private fun resetConnectionQualityIfNewSession(participant: Participant, previousSid: Participant.Sid) {
+        if (previousSid == participant.sid) {
+            return
+        }
+        if (participant.connectionQuality == ConnectionQuality.UNKNOWN) {
+            return
+        }
+        participant.connectionQuality = ConnectionQuality.UNKNOWN
+        eventBus.postEvent(
+            RoomEvent.ConnectionQualityChanged(this, participant, ConnectionQuality.UNKNOWN),
+            coroutineScope,
+        )
     }
 
     /**
@@ -1647,6 +1812,13 @@ constructor(
         reconnect(reason = reason)
     }
 
+    override fun onSubscriptionError(subscriptionResponse: LivekitRtc.SubscriptionResponse) {
+        val participant = remoteParticipants.values
+            .firstOrNull { it.trackPublications.containsKey(subscriptionResponse.trackSid) } as? RemoteParticipant
+            ?: return
+        participant.onSubscriptionError(subscriptionResponse)
+    }
+
     /**
      * @suppress
      */
@@ -1773,9 +1945,7 @@ constructor(
      * @suppress
      */
     override fun onTrackUnpublished(publication: LocalTrackPublication, participant: LocalParticipant) {
-        e2eeManager?.let { e2eeManager ->
-            e2eeManager!!.removePublishedTrack(publication.track!!, publication, participant, this)
-        }
+        e2eeManager?.removePublishedTrack(publication.track!!, publication, participant, this)
         eventBus.postEvent(RoomEvent.TrackUnpublished(this, publication, participant), coroutineScope)
     }
 
@@ -1808,9 +1978,7 @@ constructor(
         publication: RemoteTrackPublication,
         participant: RemoteParticipant,
     ) {
-        e2eeManager?.let { e2eeManager ->
-            e2eeManager!!.removeSubscribedTrack(track, publication, participant, this)
-        }
+        e2eeManager?.removeSubscribedTrack(track, publication, participant, this)
         eventBus.postEvent(RoomEvent.TrackUnsubscribed(this, track, publication, participant), coroutineScope)
     }
 

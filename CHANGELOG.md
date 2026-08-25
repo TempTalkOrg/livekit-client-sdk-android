@@ -1,5 +1,95 @@
 # client-sdk-android
 
+## 2.27.0
+
+### Minor Changes
+
+- Add `LocalAudioTrack.applyOptions`, which allows updating the audio track options on the fly. - [#974](https://github.com/livekit/client-sdk-android/pull/974) ([@davidliu](https://github.com/davidliu))
+
+### Patch Changes
+
+- Fix custom LocalAudioTrackOptions not applying correctly - [#974](https://github.com/livekit/client-sdk-android/pull/974) ([@davidliu](https://github.com/davidliu))
+
+- Properly update the server info after reconnect - [#962](https://github.com/livekit/client-sdk-android/pull/962) ([@davidliu](https://github.com/davidliu))
+
+- Scoped the protobuf consumer keep rule to the SDK's generated messages and the well-known types they embed, instead of every GeneratedMessageLite subclass in the consuming app. - [#975](https://github.com/livekit/client-sdk-android/pull/975) ([@adrian-niculescu](https://github.com/adrian-niculescu))
+
+- Fix native memory leaks on video track publish/unpublish cycles (#521). `LocalVideoTrack.dispose()` now disposes its backing `VideoSource`, which was previously left undisposed and leaked for the lifetime of the process (only the track and capturer were released). Unpublishing a video track now also stops its `RtpTransceiver`, along with any extra transceivers added for backup codecs; since a new transceiver is created on every publish, removing the track from its sender alone left them retained until the connection closed. - [#971](https://github.com/livekit/client-sdk-android/pull/971) ([@adrian-niculescu](https://github.com/adrian-niculescu))
+
+## 2.26.1
+
+### Patch Changes
+
+- Fix audio output getting stuck on the earpiece after reconnecting on a reused `Room` (Android 12+). `AudioSwitchHandler.stop()` now clears its `audioSwitch` reference synchronously (and the field is `@Volatile`) so a subsequent `start()` reliably observes the teardown and re-creates the switch, instead of racing the posted teardown runnable and reusing a stale, already-stopped switch. - [#967](https://github.com/livekit/client-sdk-android/pull/967) ([@YashJainSC](https://github.com/YashJainSC))
+
+- Emit `TrackSubscriptionFailed` events through `Room` and `RemoteParticipant` when the server detects a subscription failure - [#959](https://github.com/livekit/client-sdk-android/pull/959) ([@davidliu](https://github.com/davidliu))
+
+- Clarified documentation regarding data stream receivers and errors - [#965](https://github.com/livekit/client-sdk-android/pull/965) ([@davidliu](https://github.com/davidliu))
+
+## 2.26.0
+
+### Minor Changes
+
+- Allow customizing `maxRoundTripLatency` on `LocalParticipant.performRpc` for high-latency networks - [#953](https://github.com/livekit/client-sdk-android/pull/953) ([@1egoman](https://github.com/1egoman))
+
+- Add support for RPC V2 - [#946](https://github.com/livekit/client-sdk-android/pull/946) ([@1egoman](https://github.com/1egoman))
+
+### Patch Changes
+
+- Change proguard rule for protobufs to official recommended rule, allowing unused protobuf classes to be removed with minification - [#946](https://github.com/livekit/client-sdk-android/pull/946) ([@1egoman](https://github.com/1egoman))
+
+- Increased max data packet size for `LocalParticipant.publishData` to 65535 bytes (64KB - 1) - [#948](https://github.com/livekit/client-sdk-android/pull/948) ([@1egoman](https://github.com/1egoman))
+
+## 2.25.3
+
+### Patch Changes
+
+- docs(audio): clarify that `AudioSwitchHandler.selectDevice()` is sticky and overrides `preferredDeviceList`. Document that callers who only need a different priority order should set `preferredDeviceList` instead, and that `selectDevice(null)` clears a sticky selection. - [#941](https://github.com/livekit/client-sdk-android/pull/941) ([@daxiondi](https://github.com/daxiondi))
+
+- Update libwebrtc to 144.7559.05 - [#936](https://github.com/livekit/client-sdk-android/pull/936) ([@davidliu](https://github.com/davidliu))
+
+- fix: resume joinContinuation when LEAVE received during reconnect handshake to avoid reconnection loop hanging issue - [#934](https://github.com/livekit/client-sdk-android/pull/934) ([@YashJainSC](https://github.com/YashJainSC))
+
+- Fixed silent loss of reliable data when DataChannel.send returned false and when buffered items were replayed across multiple resumes. - [#921](https://github.com/livekit/client-sdk-android/pull/921) ([@adrian-niculescu](https://github.com/adrian-niculescu))
+
+- Fix byte streams not sending the name of the bytestream - [#939](https://github.com/livekit/client-sdk-android/pull/939) ([@davidliu](https://github.com/davidliu))
+
+- Update AudioSwitch to handle potential exception when unregistering audio device listeners - [#944](https://github.com/livekit/client-sdk-android/pull/944) ([@davidliu](https://github.com/davidliu))
+
+## 2.25.2
+
+### Patch Changes
+
+- Fix Room.connect not properly throwing ConnectException for websocket connection failures during Room.join() - [#926](https://github.com/livekit/client-sdk-android/pull/926) ([@davidliu](https://github.com/davidliu))
+
+- Fix reconnect potentially getting cancelled by websocket failure - [#926](https://github.com/livekit/client-sdk-android/pull/926) ([@davidliu](https://github.com/davidliu))
+
+- Fixed RTCEngine.addTrack leaking pendingTrackResolvers entries on timeout or caller cancellation, which previously caused subsequent publishes of the same track to fail with DuplicateTrackException until the connection was torn down. - [#920](https://github.com/livekit/client-sdk-android/pull/920) ([@adrian-niculescu](https://github.com/adrian-niculescu))
+
+- Fix exception when resending data channel messages after a resume - [#923](https://github.com/livekit/client-sdk-android/pull/923) ([@davidliu](https://github.com/davidliu))
+
+## 2.25.1
+
+### Patch Changes
+
+- Add convenience constructor to E2EEOptions for shared key encryption - [#917](https://github.com/livekit/client-sdk-android/pull/917) ([@davidliu](https://github.com/davidliu))
+
+## 2.25.0
+
+### Minor Changes
+
+- AudioOptions: Added disableAudioPrewarming flag - [#912](https://github.com/livekit/client-sdk-android/pull/912) ([@davidliu](https://github.com/davidliu))
+
+### Patch Changes
+
+- Fix potential leak for StreamSender caused by exceptions - [#913](https://github.com/livekit/client-sdk-android/pull/913) ([@davidliu](https://github.com/davidliu))
+
+- Update audio handling to use AudioManager communication device APIs on S and above - [#910](https://github.com/livekit/client-sdk-android/pull/910) ([@davidliu](https://github.com/davidliu))
+
+- Rethrow cancellation exceptions for coroutines - [#913](https://github.com/livekit/client-sdk-android/pull/913) ([@davidliu](https://github.com/davidliu))
+
+- Implement changing preferred audio device list on AudioSwitchHandler mid-call - [#910](https://github.com/livekit/client-sdk-android/pull/910) ([@davidliu](https://github.com/davidliu))
+
 ## 2.24.1
 
 ### Patch Changes

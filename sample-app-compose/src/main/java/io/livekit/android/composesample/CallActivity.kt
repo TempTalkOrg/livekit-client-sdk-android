@@ -22,6 +22,7 @@ import android.os.Parcelable
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.compose.foundation.background
@@ -35,6 +36,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.wrapContentSize
 import androidx.compose.foundation.lazy.LazyRow
@@ -72,6 +74,7 @@ import io.livekit.android.composesample.ui.theme.AppTheme
 import io.livekit.android.room.Room
 import io.livekit.android.room.participant.Participant
 import io.livekit.android.sample.CallViewModel
+import io.livekit.android.sample.MediaSendUiState
 import io.livekit.android.sample.common.R
 import io.livekit.android.sample.model.StressTest
 import kotlinx.coroutines.Dispatchers
@@ -110,6 +113,7 @@ class CallActivity : AppCompatActivity() {
 
     @OptIn(ExperimentalMaterialApi::class)
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
@@ -124,6 +128,7 @@ class CallActivity : AppCompatActivity() {
             val screencastEnabled by viewModel.screenshareEnabled.collectAsState(false)
             val permissionAllowed by viewModel.permissionAllowed.collectAsState()
             val connectionStatus by viewModel.connectionStatus.collectAsState()
+            val mediaSendUiState by viewModel.mediaSendUiState.collectAsState(MediaSendUiState.NONE)
             Content(
                 room,
                 participants,
@@ -133,6 +138,7 @@ class CallActivity : AppCompatActivity() {
                 videoEnabled,
                 screencastEnabled,
                 connectionStatus = connectionStatus,
+                mediaSendUiState = mediaSendUiState,
                 audioSwitchHandler = viewModel.audioHandler,
                 permissionAllowed = permissionAllowed,
                 onExitClick = { finish() },
@@ -188,6 +194,7 @@ class CallActivity : AppCompatActivity() {
         videoEnabled: Boolean = true,
         screencastEnabled: Boolean = false,
         connectionStatus: String = "Connected",
+        mediaSendUiState: MediaSendUiState = MediaSendUiState.NONE,
         permissionAllowed: Boolean = true,
         audioSwitchHandler: AudioSwitchHandler? = null,
         onExitClick: () -> Unit = {},
@@ -204,6 +211,7 @@ class CallActivity : AppCompatActivity() {
             ConstraintLayout(
                 modifier = Modifier
                     .fillMaxSize()
+                    .safeDrawingPadding()
                     .background(MaterialTheme.colors.background),
             ) {
                 val (speakerView, audienceRow, buttonBar, connectionStatusLabel) = createRefs()
@@ -229,7 +237,11 @@ class CallActivity : AppCompatActivity() {
                 }
 
                 Text(
-                    text = connectionStatus,
+                    text = if (mediaSendUiState == MediaSendUiState.ROOM_RECOVERING) {
+                        "连接中… / Reconnecting…"
+                    } else {
+                        connectionStatus
+                    },
                     style = MaterialTheme.typography.subtitle2,
                     color = Color.White,
                     modifier = Modifier
@@ -239,6 +251,16 @@ class CallActivity : AppCompatActivity() {
                             start.linkTo(parent.start)
                         },
                 )
+
+                if (mediaSendUiState == MediaSendUiState.MEDIA_RECOVERING) {
+                    Text(
+                        text = "对方可能听不到你，正在恢复… / Others may not hear you. Recovering…",
+                        style = MaterialTheme.typography.subtitle2,
+                        color = Color(0xFFFF9800),
+                        modifier = Modifier
+                            .padding(start = 12.dp, top = 36.dp),
+                    )
+                }
 
                 // Audience row to display all participants.
                 LazyRow(

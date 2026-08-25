@@ -152,7 +152,7 @@ class ParticipantItemTest {
         return constructor.newInstance(
             mock<ConstraintLayout>(),
             cameraRenderer,
-            mock<ImageView>(),
+            mock<TextView>(),
             mock<FrameLayout>(),
             mock<TextView>(),
             mock<ImageView>(),

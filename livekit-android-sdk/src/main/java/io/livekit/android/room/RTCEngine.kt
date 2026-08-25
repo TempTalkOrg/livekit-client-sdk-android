@@ -47,7 +47,9 @@ import io.livekit.android.util.TTLMap
 import io.livekit.android.util.flow
 import io.livekit.android.util.flowDelegate
 import io.livekit.android.util.nullSafe
+import io.livekit.android.util.rethrowIfCancellationSignal
 import io.livekit.android.util.withCheckLock
+import io.livekit.android.util.withDeadline
 import io.livekit.android.webrtc.DataChannelManager
 import io.livekit.android.webrtc.DataPacketBuffer
 import io.livekit.android.webrtc.DataPacketItem
@@ -71,7 +73,6 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.yield
 import livekit.LivekitModels
@@ -211,7 +212,10 @@ internal constructor(
     private val reliableMessageBuffer = DataPacketBuffer(RELIABLE_RETRY_AMOUNT)
     private val reliableReceivedState = TTLMap<String, Int>(RELIABLE_RECEIVE_STATE_TTL_MS)
 
-    private var isSubscriberPrimary = false
+    @FlowObservable
+    @get:FlowObservable
+    internal var isSubscriberPrimary: Boolean by flowDelegate(false)
+        private set
 
     @Volatile
     private var isClosed = true
@@ -236,8 +240,27 @@ internal constructor(
     @Volatile
     private var sessionGeneration = 0L
 
-    @Volatile
-    private var hasPublished = false
+    @FlowObservable
+    @get:FlowObservable
+    internal var hasPublished: Boolean by flowDelegate(false)
+        private set
+
+    /**
+     * Latest publisher PeerConnection state used to derive [MediaSendConnectionState].
+     * Null when no publisher observer is active.
+     */
+    @FlowObservable
+    @get:FlowObservable
+    internal var publisherConnectionState: PeerConnection.PeerConnectionState? by flowDelegate(null)
+        private set
+
+    /**
+     * Whether the publisher PeerConnection has reached CONNECTED in this room session.
+     */
+    @FlowObservable
+    @get:FlowObservable
+    internal var hasPublisherEverConnected: Boolean by flowDelegate(false)
+        private set
 
     private var coroutineScope = CloseableCoroutineScope(SupervisorJob() + ioDispatcher)
 
@@ -278,6 +301,7 @@ internal constructor(
         // Mark the start of a new session so that any stale disconnect callback from
         // the previous session (e.g. a late server `leave` response) can be discarded.
         sessionGeneration++
+        hasPublisherEverConnected = false
         coroutineScope.close()
         coroutineScope = CloseableCoroutineScope(SupervisorJob() + ioDispatcher)
         sessionUrl = url
@@ -362,6 +386,7 @@ internal constructor(
                 subscriber = newSubscriber
                 publisherObserver = newPublisherObserver
                 subscriberObserver = newSubscriberObserver
+                publisherConnectionState = newPublisherObserver.connectionState
 
                 val connectionStateListener: PeerConnectionStateListener = { newState, tag ->
                     val tagL = "listener${Integer.toHexString(System.identityHashCode(this))}"
@@ -400,6 +425,18 @@ internal constructor(
                     }
                 } else {
                     newPublisherObserver.connectionChangeListener = connectionStateListener
+                }
+
+                // Mirror publisher PeerConnection state for MediaSendConnectionState.
+                coroutineScope.launch {
+                    newPublisherObserver::connectionState.flow.collect { pcState ->
+                        if (publisherObserver === newPublisherObserver) {
+                            publisherConnectionState = pcState
+                            if (pcState == PeerConnection.PeerConnectionState.CONNECTED) {
+                                hasPublisherEverConnected = true
+                            }
+                        }
+                    }
                 }
 
                 ensureActive()
@@ -460,10 +497,17 @@ internal constructor(
         }
 
         // Suspend until signal client receives message confirming track publication.
-        return withTimeout(20.seconds) {
+        return withDeadline(20.seconds) {
             suspendCancellableCoroutine { cont ->
                 synchronized(pendingTrackResolvers) {
                     pendingTrackResolvers[cid] = cont
+                }
+                cont.invokeOnCancellation {
+                    synchronized(pendingTrackResolvers) {
+                        if (pendingTrackResolvers[cid] === cont) {
+                            pendingTrackResolvers.remove(cid)
+                        }
+                    }
                 }
                 client.sendAddTrack(
                     cid = cid,
@@ -510,6 +554,9 @@ internal constructor(
         reconnectingJob = null
         coroutineScope.close()
         hasPublished = false
+        publisherConnectionState = null
+        hasPublisherEverConnected = false
+        isSubscriberPrimary = false
         sessionUrl = null
         sessionToken = null
         connectOptions = null
@@ -542,6 +589,7 @@ internal constructor(
                     subscriber = null
                     publisherObserver = null
                     subscriberObserver = null
+                    publisherConnectionState = null
 
                     reliableBufferedAmountJob?.cancel()
                     reliableBufferedAmountJob = null
@@ -668,7 +716,8 @@ internal constructor(
                     try {
                         url = regionUrlProvider?.getNextBestRegionUrl() ?: url
                     } catch (e: Exception) {
-                        LKLog.d(e) { "[reconnect][net][${retries + 1}] exception while getting next best region url while reconnecting" }
+                        e.rethrowIfCancellationSignal()
+                        LKLog.d(e) { "[reconnect][net][${retries + 1}] Exception while getting next best region url while reconnecting." }
                     }
                 }
 
@@ -724,6 +773,8 @@ internal constructor(
                         subscriber?.updateRTCConfig(rtcConfig)
                         publisher?.updateRTCConfig(rtcConfig)
                         lastMessageSeq = reconnectResponse.lastMessageSeq
+                    } else {
+                        LKLog.w { "[reconnect][signal][${retries + 1}] Did not receive reconnect response" }
                     }
                     client.onReadyForResponses()
                     LKLog.i { "[reconnect][signal][${retries + 1}] signal reconnect succeeded, starting ICE restart" }
@@ -746,7 +797,8 @@ internal constructor(
                         listener?.onFullReconnecting()
                         joinImpl(url!!, token, connectOptions, lastRoomOptions ?: RoomOptions())
                     } catch (e: Exception) {
-                        LKLog.w(e) { "[reconnect][signal][${retries + 1}] error during full reconnection" }
+                        e.rethrowIfCancellationSignal()
+                        LKLog.w(e) { "[reconnect][signal][${retries + 1}] Error during reconnection." }
                         // reconnect failed, retry.
                         continue
                     }
@@ -789,6 +841,7 @@ internal constructor(
                             try {
                                 performSignalReconnect()
                             } catch (e: Exception) {
+                                e.rethrowIfCancellationSignal()
                                 LKLog.w(e) { "[reconnect][signal][${retries + 1}] error during fallback signal reconnect: ${e.message}" }
                                 continue
                             }
@@ -802,6 +855,7 @@ internal constructor(
                         try {
                             performSignalReconnect()
                         } catch (e: Exception) {
+                            e.rethrowIfCancellationSignal()
                             LKLog.w(e) { "[reconnect][signal][${retries + 1}] error during signal reconnect: ${e.message}" }
                             continue
                         }
@@ -888,12 +942,12 @@ internal constructor(
                         // ICE restart may keep PC state as CONNECTED and never emit a fresh callback.
                         connectionState = ConnectionState.CONNECTED
                     }
-                    val finalLastMessageSeq = lastMessageSeq
-                    if (finalLastMessageSeq != null) {
-                        val resendResult = resendReliableMessagesForResume(finalLastMessageSeq)
-                        if (resendResult.isFailure) {
-                            LKLog.w(resendResult.exceptionOrNull()) {
-                                "[reconnect][signal][${retries + 1}] failed to resend reliable messages after resume; retrying reconnect"
+                    val resumeMessageSeq = lastMessageSeq
+                    if (resumeMessageSeq != null) {
+                        resendReliableMessagesForResume(resumeMessageSeq).onFailure { e ->
+                            LKLog.w(e) {
+                                "[reconnect][signal][${retries + 1}] Reliable data replay did not complete on resume; " +
+                                    "buffered items remain queued for the next resume."
                             }
                         }
                     }
@@ -944,6 +998,7 @@ internal constructor(
         try {
             ensurePublisherConnected(dataPacket.kind)
         } catch (e: Exception) {
+            e.rethrowIfCancellationSignal()
             return Result.failure(e)
         }
 
@@ -973,38 +1028,52 @@ internal constructor(
                     }
                 }
 
-                if (dataPacket.kind == LivekitModels.DataPacket.Kind.RELIABLE) {
+                val isReliable = dataPacket.kind == LivekitModels.DataPacket.Kind.RELIABLE
+                if (isReliable) {
                     dataPacket = dataPacket.toBuilder()
                         .setSequence(reliableDataSequence)
                         .build()
-                    reliableDataSequence++
                 }
 
-                val byteBuffer = ByteBuffer.wrap(dataPacket.toByteArray())
+                val packetBytes = dataPacket.toByteArray()
 
-                if (dataPacket.kind == LivekitModels.DataPacket.Kind.RELIABLE) {
-                    reliableMessageBuffer.queue(DataPacketItem(byteBuffer, dataPacket.sequence))
-                    // Buffer reliable messages during both full (RECONNECTING) and quick
-                    // (RESUMING) reconnect. The reliable buffer is replayed by
-                    // resendReliableMessagesForResume once the publisher reconnects, so
-                    // callers don't lose data and we avoid sending into a torn-down
-                    // DataChannel mid-reconnect.
-                    // See Docs/reconnect-metrics-storm-and-worker-crash-fix.md (Fix-7).
-                    if (this.connectionState == ConnectionState.RECONNECTING ||
-                        this.connectionState == ConnectionState.RESUMING
-                    ) {
-                        return Result.success(Unit)
-                    }
+                if (packetBytes.size > MAX_DATA_PACKET_SIZE) {
+                    return Result.failure(IllegalArgumentException("packet size (${packetBytes.size}) exceeds the max size (${MAX_DATA_PACKET_SIZE})"))
+                }
+
+                // Buffer reliable messages during both full (RECONNECTING) and quick
+                // (RESUMING) reconnect. The reliable buffer is replayed by
+                // resendReliableMessagesForResume once the publisher reconnects, so
+                // callers don't lose data and we avoid sending into a torn-down
+                // DataChannel mid-reconnect.
+                // See Docs/reconnect-metrics-storm-and-worker-crash-fix.md (Fix-7).
+                if (isReliable && (this.connectionState == ConnectionState.RECONNECTING ||
+                        this.connectionState == ConnectionState.RESUMING)) {
+                    reliableMessageBuffer.queue(DataPacketItem(ByteBuffer.wrap(packetBytes), dataPacket.sequence))
+                    reliableDataSequence++
+                    return Result.success(Unit)
                 }
                 val buf = DataChannel.Buffer(
-                    byteBuffer,
+                    ByteBuffer.wrap(packetBytes),
                     true,
                 )
                 val channel = dataChannelForKind(dataPacket.kind)
                     ?: throw RoomException.ConnectException("channel not established for ${dataPacket.kind.name}")
 
-                channel.send(buf)
+                if (!channel.send(buf)) {
+                    return Result.failure(
+                        RoomException.ConnectException("failed to send data packet for ${dataPacket.kind.name}"),
+                    )
+                }
+
+                if (isReliable) {
+                    // Wrap a fresh ByteBuffer so the queued item's position stays at 0; the
+                    // ByteBuffer just sent has been drained by DataChannel.send.
+                    reliableMessageBuffer.queue(DataPacketItem(ByteBuffer.wrap(packetBytes), dataPacket.sequence))
+                    reliableDataSequence++
+                }
             } catch (e: Exception) {
+                e.rethrowIfCancellationSignal()
                 return Result.failure(e)
             }
             return Result.success(Unit)
@@ -1023,6 +1092,7 @@ internal constructor(
         try {
             ensurePublisherConnected(LivekitModels.DataPacket.Kind.RELIABLE)
         } catch (e: Exception) {
+            e.rethrowIfCancellationSignal()
             return Result.failure(e)
         }
         val channel = dataChannelForKind(LivekitModels.DataPacket.Kind.RELIABLE)
@@ -1030,8 +1100,17 @@ internal constructor(
 
         synchronized(reliableStateLock) {
             reliableMessageBuffer.popToSequence(lastMessageSeq)
-            reliableMessageBuffer.getAll().forEach { item ->
-                channel.send(DataChannel.Buffer(item.data, true))
+            for (item in reliableMessageBuffer.getAll()) {
+                // Send a duplicate so the underlying buffer keeps position=0 and survives
+                // multiple resume attempts. DataChannel.send drains the buffer's position to
+                // its limit; without duplicate(), the second replay would send empty bytes.
+                if (!channel.send(DataChannel.Buffer(item.data.duplicate(), true))) {
+                    return Result.failure(
+                        RoomException.ConnectException(
+                            "failed to replay reliable data packet at sequence ${item.sequence}",
+                        ),
+                    )
+                }
             }
         }
 
@@ -1042,6 +1121,7 @@ internal constructor(
         try {
             ensurePublisherConnected(kind)
         } catch (e: Exception) {
+            e.rethrowIfCancellationSignal()
             return
         }
         val manager = dataChannelManagerForKind(kind) ?: return
@@ -1227,6 +1307,7 @@ internal constructor(
         fun onStreamStateUpdate(streamStates: List<LivekitRtc.StreamStateInfo>)
         fun onSubscribedQualityUpdate(subscribedQualityUpdate: LivekitRtc.SubscribedQualityUpdate)
         fun onSubscriptionPermissionUpdate(subscriptionPermissionUpdate: LivekitRtc.SubscriptionPermissionUpdate)
+        fun onSubscriptionError(subscriptionResponse: LivekitRtc.SubscriptionResponse)
         fun onSignalConnected(isResume: Boolean)
         fun onFullReconnecting()
         suspend fun onPostReconnect(isFullReconnect: Boolean)
@@ -1250,7 +1331,17 @@ internal constructor(
          */
         @VisibleForTesting
         const val LOSSY_DATA_CHANNEL_LABEL = "_lossy"
-        internal const val MAX_DATA_PACKET_SIZE = 15 * 1024 // 15 KB
+        internal const val TARGET_DATA_PACKET_SIZE = 15 * 1024 // 15 KB
+
+        /**
+         * Corresponds to the max-message-size in SDP. Attempting to send packets
+         * over this size will cause the data channel to close, so this must be enforced
+         * within the SDK. Note that [DataChannel.send] will still report true
+         * even if a huge packet is sent, so it's not a usable signal.
+         *
+         * TODO: get max-message-size from SDP or equivalent from libwebrtc.
+         */
+        internal const val MAX_DATA_PACKET_SIZE = 64 * 1024 - 1 // 64 KB
         private const val MAX_RECONNECT_RETRIES = 30
         private const val MAX_RECONNECT_TIMEOUT = 60 * 1000
         private const val MAX_ICE_CONNECT_TIMEOUT_MS = 20000
@@ -1495,6 +1586,10 @@ internal constructor(
         listener?.onSubscriptionPermissionUpdate(subscriptionPermissionUpdate)
     }
 
+    override fun onSubscriptionError(subscriptionResponse: LivekitRtc.SubscriptionResponse) {
+        listener?.onSubscriptionError(subscriptionResponse)
+    }
+
     override fun onRefreshToken(token: String) {
         sessionToken = token
         regionUrlProvider?.token = token
@@ -1726,6 +1821,21 @@ internal constructor(
                     val t = sender.track() ?: continue
                     if (t.id() == rtcTrack.id()) {
                         this@withPeerConnection.removeTrack(sender)
+                    }
+                }
+            }
+        }
+    }
+
+    internal fun stopTransceivers(transceivers: List<RtpTransceiver>) {
+        if (transceivers.isEmpty()) {
+            return
+        }
+        runBlocking {
+            publisher?.withPeerConnection {
+                for (transceiver in transceivers) {
+                    if (!transceiver.isStopped) {
+                        transceiver.stopInternal()
                     }
                 }
             }

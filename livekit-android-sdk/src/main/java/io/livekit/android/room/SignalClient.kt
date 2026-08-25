@@ -29,8 +29,10 @@ import io.livekit.android.stats.getClientInfo
 import io.livekit.android.util.CloseableCoroutineScope
 import io.livekit.android.util.Either
 import io.livekit.android.util.LKLog
+import io.livekit.android.util.TimeoutException
 import io.livekit.android.util.toHttpUrl
 import io.livekit.android.util.toWebsocketUrl
+import io.livekit.android.util.withDeadline
 import io.livekit.android.webrtc.toProtoSessionDescription
 import kotlinx.coroutines.CancellableContinuation
 import kotlinx.coroutines.CoroutineDispatcher
@@ -38,12 +40,10 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.InternalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -61,10 +61,14 @@ import okhttp3.Response
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
 import java.net.UnknownHostException
+import java.security.cert.CertPathValidatorException
+import java.security.cert.CertificateException
 import java.util.Date
 import javax.inject.Inject
 import javax.inject.Named
 import javax.inject.Singleton
+import javax.net.ssl.SSLPeerUnverifiedException
+import kotlin.time.Duration.Companion.milliseconds
 
 /**
  * SignalClient to LiveKit WS servers
@@ -129,12 +133,7 @@ constructor(
     // join will always return a JoinResponse.
     // reconnect will return a ReconnectResponse or a Unit if a different response was received.
     @Volatile
-    private var joinContinuation: CancellableContinuation<
-        Either<
-            JoinResponse,
-            Either<ReconnectResponse, Unit>,
-            >,
-        >? = null
+    private var joinContinuation: CancellableContinuation<ConnectResult>? = null
 
     @Volatile
     private var joinContinuationAttemptId: Long = 0
@@ -175,8 +174,10 @@ constructor(
         options: ConnectOptions = ConnectOptions(),
         roomOptions: RoomOptions = RoomOptions(),
     ): JoinResponse {
-        val joinResponse = connect(url, token, options, roomOptions)
-        return (joinResponse as Either.Left).value
+        return when (val result = connect(url, token, options, roomOptions)) {
+            is ConnectResult.Join -> result.response
+            else -> throw IllegalStateException("Unexpected response during join: $result")
+        }
     }
 
     /**
@@ -185,17 +186,22 @@ constructor(
     @Throws(Exception::class)
     @VisibleForTesting
     suspend fun reconnect(url: String, token: String, participantSid: String?): Either<ReconnectResponse, Unit> {
-        val reconnectResponse = connect(
-            url,
-            token,
-            (lastOptions ?: ConnectOptions()).copy()
-                .apply {
-                    reconnect = true
-                    this.participantSid = participantSid
-                },
-            lastRoomOptions ?: RoomOptions(),
-        )
-        return (reconnectResponse as Either.Right).value
+        return when (
+            val result = connect(
+                url,
+                token,
+                (lastOptions ?: ConnectOptions()).copy()
+                    .apply {
+                        reconnect = true
+                        this.participantSid = participantSid
+                    },
+                lastRoomOptions ?: RoomOptions(),
+            )
+        ) {
+            is ConnectResult.Reconnect -> Either.Left(result.response)
+            is ConnectResult.OtherResponse -> Either.Right(Unit)
+            is ConnectResult.Join -> throw IllegalStateException("Unexpected join response during reconnect")
+        }
     }
 
     private suspend fun connect(
@@ -203,12 +209,12 @@ constructor(
         token: String,
         options: ConnectOptions,
         roomOptions: RoomOptions,
-    ): Either<JoinResponse, Either<ReconnectResponse, Unit>> {
+    ): ConnectResult {
         // Clean up any pre-existing connection.
         close(reason = "Starting new connection", shouldClearQueuedRequests = false)
 
         val effectiveOptions = effectiveConnectOptions(options)
-        val wsUrlString = "${url.toWebsocketUrl()}/rtc${createConnectionParams(token, getClientInfo(), effectiveOptions, roomOptions)}"
+        val wsUrlString = "${url.toWebsocketUrl()}/rtc${createConnectionParams(token, getClientInfo(effectiveOptions.clientProtocol), effectiveOptions, roomOptions)}"
         isReconnecting = effectiveOptions.reconnect
 
         LKLog.i { "connecting to $wsUrlString" }
@@ -236,7 +242,7 @@ constructor(
 
         try {
             LKLog.i { "[reconnect][signal] connect - in, attempt=$attemptId" }
-            val ret = connectWithTimeout(15 * 1000, wsUrlString, token, effectiveOptions, attemptId, sendOnOpen)
+            val ret = connectWithTimeout(wsUrlString, token, effectiveOptions, attemptId, sendOnOpen)
             LKLog.i { "[reconnect][signal] connect - out, attempt=$attemptId" }
             return ret
         } catch (t: Throwable) {
@@ -264,15 +270,14 @@ constructor(
     }
 
     private suspend fun connectWithTimeout(
-        timeMillis: Long,
         url: String,
         token: String,
         options: ConnectOptions,
         attemptId: Long,
         sendOnOpen: ByteString?,
-    ): Either<JoinResponse, Either<ReconnectResponse, Unit>> {
+    ): ConnectResult {
         return try {
-            withTimeout(timeMillis) {
+            withDeadline(SIGNAL_CONNECT_TIMEOUT.milliseconds) {
                 suspendCancellableCoroutine { it ->
                     // Wait for join/reconnect response via WebSocketListener
                     synchronized(joinContinuationLock) {
@@ -295,7 +300,7 @@ constructor(
                     LKLog.i { "[reconnect][signal] new transport created - end, attempt=$attemptId, transport=$newTransport" }
                 }
             }
-        } catch (t: TimeoutCancellationException) {
+        } catch (t: TimeoutException) {
             // Timeout: close and propagate
             val localTransport = transport
             if (localTransport != null && localTransport.attemptId == attemptId && isActiveTransport(localTransport)) {
@@ -310,19 +315,14 @@ constructor(
             // can handle it as a regular SDK exception without depending on coroutine internals,
             // and so it does not propagate as a CancellationException to the calling scope.
             throw RoomException.ConnectTimeoutException(
-                message = "Timed out connecting to signal server after $timeMillis ms",
+                message = "Timed out connecting to signal server after $SIGNAL_CONNECT_TIMEOUT ms",
                 cause = t,
-                timeoutMs = timeMillis,
+                timeoutMs = SIGNAL_CONNECT_TIMEOUT,
             )
         }
     }
 
-    private fun clearJoinContinuation(attemptId: Long? = null): CancellableContinuation<
-        Either<
-            JoinResponse,
-            Either<ReconnectResponse, Unit>,
-            >,
-        >? {
+    private fun clearJoinContinuation(attemptId: Long? = null): CancellableContinuation<ConnectResult>? {
         synchronized(joinContinuationLock) {
             if (attemptId != null && joinContinuationAttemptId != attemptId) {
                 return null
@@ -349,10 +349,7 @@ constructor(
         }
     }
 
-    private fun resumeJoinContinuation(
-        attemptId: Long,
-        value: Either<JoinResponse, Either<ReconnectResponse, Unit>>,
-    ) {
+    private fun resumeJoinContinuation(attemptId: Long, value: ConnectResult) {
         clearJoinContinuation(attemptId)?.resumeWith(Result.success(value))
     }
 
@@ -393,6 +390,7 @@ constructor(
         addParam(CONNECT_QUERY_OS, clientInfo.os)
         addParam(CONNECT_QUERY_OS_VERSION, clientInfo.osVersion)
         addParam(CONNECT_QUERY_NETWORK_TYPE, networkInfo.getNetworkType().protoName)
+        addParam(CONNECT_QUERY_CLIENT_PROTOCOL, options.clientProtocol.value.toString())
 
         if (options.ttCallRequest != null && token.isEmpty()) {
             addParam(CONNECT_QUERY_TT_VERSION, "1")
@@ -515,32 +513,40 @@ constructor(
             return
         }
         var exceptionError: Exception? = lastConnectionException.also { lastConnectionException = null }
+        val validationToken = lastToken
         try {
-            if (exceptionError == null && !t.hasUnknownHostCause()) {
-                lastUrl?.let {
-                    val validationUrl = it.toHttpUrl().replaceFirst("/rtc?", "/rtc/validate?")
-                    val request = Request.Builder()
-                        .url(validationUrl)
-                        .apply {
-                            if (lastToken != null) {
-                                addHeader("Authorization", "Bearer $lastToken")
-                            }
-                        }
-                        .build()
-                    okHttpClient.newCall(request).execute().use { resp ->
-                        val body = resp.body
-                        if (!resp.isSuccessful) {
-                            val reason = body?.string()
-                            exceptionError = if (resp.code == 401) {
-                                RoomException.NoAuthException(reason)
-                            } else {
-                                Exception(reason)
+            if (exceptionError == null) {
+                when {
+                    t.hasUnknownHostCause() -> {
+                        LKLog.i { "[reconnect][signal] skipping connection validation for UnknownHostException" }
+                    }
+                    t.hasCertificateValidationCause() -> {
+                        LKLog.i { "[reconnect][signal] skipping connection validation for certificate failure" }
+                    }
+                    validationToken.isNullOrBlank() -> {
+                        LKLog.i { "[reconnect][signal] skipping connection validation because token is blank" }
+                    }
+                    else -> {
+                        lastUrl?.let {
+                            val validationUrl = it.toHttpUrl().replaceFirst("/rtc?", "/rtc/validate?")
+                            val request = Request.Builder()
+                                .url(validationUrl)
+                                .addHeader("Authorization", "Bearer $validationToken")
+                                .build()
+                            okHttpClient.newCall(request).execute().use { resp ->
+                                val body = resp.body
+                                if (!resp.isSuccessful) {
+                                    val reason = body?.string()
+                                    exceptionError = if (resp.code == 401) {
+                                        RoomException.NoAuthException(reason)
+                                    } else {
+                                        Exception(reason)
+                                    }
+                                }
                             }
                         }
                     }
                 }
-            } else if (exceptionError == null) {
-                LKLog.i { "[reconnect][signal] skipping connection validation for UnknownHostException" }
             }
         } catch (e: Throwable) {
             LKLog.e { "failed to validate connection" }
@@ -550,6 +556,9 @@ constructor(
             LKLog.i { "[reconnect][signal] transport failure ignored after validation (stale), transport=$transport" }
             return
         }
+
+        val wasConnected = isConnected
+        val wasReconnectHandshake = joinContinuation != null && isReconnecting
 
         val error = exceptionError
         if (error != null) {
@@ -562,11 +571,12 @@ constructor(
             failJoinContinuation(transport.attemptId, t)
         }
 
-        val wasConnected = isConnected
-
-        if (wasConnected) {
+        if (wasConnected || wasReconnectHandshake) {
             // onClosing/onClosed will not be called after onFailure.
             // Handle websocket closure here.
+            // Also handle failure during a soft reconnect handshake (reconnect query): isConnected is
+            // still false but the upper layer should be notified like a close. Initial join handshake
+            // failures do not call onClose so RTCEngine can surface them via onError / onFailToConnect.
             handleWebSocketClose(
                 transport = transport,
                 reason = error?.message ?: response?.toString() ?: t.localizedMessage ?: "transport failure",
@@ -581,6 +591,20 @@ constructor(
         }
         LKLog.i { "[reconnect][quic] transport restarted, result=$result, address=$address" }
         listener?.onTransportRestarted(result, address)
+    }
+
+    private fun Throwable.hasCertificateValidationCause(): Boolean {
+        var current: Throwable? = this
+        val visited = HashSet<Throwable>()
+        while (current != null && visited.add(current)) {
+            when (current) {
+                is CertificateException,
+                is CertPathValidatorException,
+                is SSLPeerUnverifiedException -> return true
+            }
+            current = current.cause
+        }
+        return false
     }
 
     private fun Throwable.hasUnknownHostCause(): Boolean {
@@ -900,7 +924,7 @@ constructor(
                     edition = ServerInfo.Edition.fromProto(response.join.serverInfo.edition),
                     version = serverVersion,
                 )
-                resumeJoinContinuation(transport.attemptId, Either.Left(response.join))
+                resumeJoinContinuation(transport.attemptId, ConnectResult.Join(response.join))
             } else if (response.hasLeave()) {
                 if (!isConnected) {
                     failJoinContinuation(
@@ -923,9 +947,20 @@ constructor(
                 startPingJob()
 
                 if (response.hasReconnect()) {
-                    resumeJoinContinuation(transport.attemptId, Either.Right(Either.Left(response.reconnect)))
+                    if (response.reconnect.hasServerInfo()) {
+                        try {
+                            serverVersion = Semver(response.reconnect.serverInfo.version)
+                        } catch (t: Throwable) {
+                            LKLog.w(t) { "Thrown while trying to parse server version from reconnect." }
+                        }
+                        serverInfo = ServerInfo(
+                            edition = ServerInfo.Edition.fromProto(response.reconnect.serverInfo.edition),
+                            version = serverVersion,
+                        )
+                    }
+                    resumeJoinContinuation(transport.attemptId, ConnectResult.Reconnect(response.reconnect))
                 } else {
-                    resumeJoinContinuation(transport.attemptId, Either.Right(Either.Right(Unit)))
+                    resumeJoinContinuation(transport.attemptId, ConnectResult.OtherResponse)
                     // Non-reconnect response, handle normally
                     shouldProcessMessage = true
                 }
@@ -1042,21 +1077,16 @@ constructor(
             }
 
             LivekitRtc.SignalResponse.MessageCase.RECONNECT -> {
-                // TODO
+                // Handshake-only message; handled in handleSignalResponse() before connection.
+                LKLog.d { "ignoring reconnect response received after connected" }
             }
 
             LivekitRtc.SignalResponse.MessageCase.SUBSCRIPTION_RESPONSE -> {
-                // TODO
+                listener?.onSubscriptionError(response.subscriptionResponse)
             }
 
             LivekitRtc.SignalResponse.MessageCase.REQUEST_RESPONSE -> {
                 // TODO
-            }
-
-            LivekitRtc.SignalResponse.MessageCase.MESSAGE_NOT_SET,
-            null,
-            -> {
-                LKLog.v { "empty messageCase!" }
             }
 
             LivekitRtc.SignalResponse.MessageCase.ROOM_MOVED -> {
@@ -1069,6 +1099,24 @@ constructor(
 
             LivekitRtc.SignalResponse.MessageCase.SUBSCRIBED_AUDIO_CODEC_UPDATE -> {
                 // TODO
+            }
+
+            LivekitRtc.SignalResponse.MessageCase.PUBLISH_DATA_TRACK_RESPONSE -> {
+                // TODO
+            }
+
+            LivekitRtc.SignalResponse.MessageCase.UNPUBLISH_DATA_TRACK_RESPONSE -> {
+                // TODO
+            }
+
+            LivekitRtc.SignalResponse.MessageCase.DATA_TRACK_SUBSCRIBER_HANDLES -> {
+                // TODO
+            }
+
+            LivekitRtc.SignalResponse.MessageCase.MESSAGE_NOT_SET,
+            null,
+            -> {
+                LKLog.v { "empty messageCase!" }
             }
         }
     }
@@ -1164,10 +1212,21 @@ constructor(
         fun onStreamStateUpdate(streamStates: List<LivekitRtc.StreamStateInfo>)
         fun onSubscribedQualityUpdate(subscribedQualityUpdate: LivekitRtc.SubscribedQualityUpdate)
         fun onSubscriptionPermissionUpdate(subscriptionPermissionUpdate: LivekitRtc.SubscriptionPermissionUpdate)
+        fun onSubscriptionError(subscriptionResponse: LivekitRtc.SubscriptionResponse)
         fun onRefreshToken(token: String)
         fun onLocalTrackUnpublished(trackUnpublished: LivekitRtc.TrackUnpublishedResponse)
         fun onLocalTrackSubscribed(trackSubscribed: LivekitRtc.TrackSubscribed)
         fun onTransportRestarted(result: Int, address: String?) {}
+    }
+
+    /**
+     * Result of waiting for the initial signal response after opening the WebSocket.
+     * Join always yields [Join]; reconnect yields [Reconnect] or [OtherResponse].
+     */
+    private sealed class ConnectResult {
+        data class Join(val response: JoinResponse) : ConnectResult()
+        data class Reconnect(val response: ReconnectResponse) : ConnectResult()
+        data object OtherResponse : ConnectResult()
     }
 
     companion object {
@@ -1183,6 +1242,7 @@ constructor(
         const val CONNECT_QUERY_NETWORK_TYPE = "network"
         const val CONNECT_QUERY_PARTICIPANT_SID = "sid"
         const val CONNECT_QUERY_TT_VERSION = "tt_version"
+        const val CONNECT_QUERY_CLIENT_PROTOCOL = "client_protocol"
 
         const val SD_TYPE_ANSWER = "answer"
         const val SD_TYPE_OFFER = "offer"
@@ -1210,6 +1270,7 @@ constructor(
 //            iceServer("stun:stun3.l.google.com:19302"),
 //            iceServer("stun:stun4.l.google.com:19302"),
         )
+        private const val SIGNAL_CONNECT_TIMEOUT: Long = 15000
         const val CLOSE_REASON_NORMAL_CLOSURE = 1000
         const val CLOSE_REASON_PING_TIMEOUT = 3000
         const val CLOSE_REASON_WEBSOCKET_FAILURE = 3500
@@ -1233,6 +1294,27 @@ enum class ProtocolVersion(val value: Int) {
 
     // new leave request handling
     v13(13),
+}
+
+/**
+ * The protocol version this SDK advertises to **peers** (other participants) for
+ * client-to-client feature negotiation (RPC v2, etc.). Distinct from [ProtocolVersion],
+ * which tracks the signaling protocol between client and server.
+ *
+ * Sent to the server during the join handshake via the `client_protocol` connection
+ * query parameter and `ClientInfo.client_protocol`; the server then populates
+ * `ParticipantInfo.client_protocol` for other peers in the room to read.
+ */
+@Suppress("unused")
+enum class ClientProtocolVersion(val value: Int) {
+    /** Initial client protocol. RPC v1 only (15 KB packet payload limit). */
+    DEFAULT(0),
+
+    /**
+     * RPC v2: request and success-response payloads are carried over text data streams
+     * instead of inline packets, lifting the 15 KB payload limit.
+     */
+    DATA_STREAM_RPC(1),
 }
 
 class ServerInfo(
