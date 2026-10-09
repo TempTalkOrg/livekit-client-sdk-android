@@ -55,6 +55,10 @@ public class Config {
     public String proxySni = "";
     public String proxyCaCertPem = "";
     public String spkiPin = "";
+    // VPN routing policy: "os", "prefer-physical", or "force-physical".
+    public String vpnPolicy = "";
+    // Android Network.getNetworkHandle() value used to bind native sockets.
+    public long androidNetHandle = 0;
 
     public Config() {
         // Default constructor

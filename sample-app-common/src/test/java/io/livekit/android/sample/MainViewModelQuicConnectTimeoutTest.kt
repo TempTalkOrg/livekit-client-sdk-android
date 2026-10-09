@@ -58,4 +58,15 @@ class MainViewModelQuicConnectTimeoutTest {
         viewModel.reset()
         assertEquals(DEFAULT_QUIC_CONNECT_TIMEOUT_MS, viewModel.getQuicConnectTimeoutMs())
     }
+
+    @Test
+    fun `force physical preference saves and resets`() {
+        val viewModel = MainViewModel(application)
+
+        viewModel.setForcePhysicalOn(true)
+        assertEquals(true, MainViewModel(application).getForcePhysicalOn())
+
+        viewModel.reset()
+        assertEquals(false, viewModel.getForcePhysicalOn())
+    }
 }

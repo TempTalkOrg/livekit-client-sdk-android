@@ -175,6 +175,21 @@ data class ConnectOptions(
      * Only used when [useQuicSignal] is true.
      */
     val quicConnectTimeoutMs: Int = 7000,
+
+    /**
+     * Forces QUIC signaling to use [physicalNetworkHandle] instead of the
+     * operating system's default route. Ignored when [useQuicSignal] is false.
+     *
+     * When the handle is unavailable, QUIC fails and the SDK falls back to
+     * WebSocket instead of silently routing through a VPN.
+     */
+    val forcePhysical: Boolean = false,
+
+    /**
+     * Value returned by `Network.getNetworkHandle()` for a non-VPN network.
+     * Required on Android when [forcePhysical] is true.
+     */
+    val physicalNetworkHandle: Long = 0,
 ) {
     internal var reconnect: Boolean = false
     internal var participantSid: String? = null

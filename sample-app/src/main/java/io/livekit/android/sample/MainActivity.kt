@@ -63,27 +63,36 @@ class MainActivity : AppCompatActivity() {
         val savedQuicDeviceType = viewModel.getQuicDeviceType()
         val savedQuicCidTag = viewModel.getQuicCidTag()
         val savedQuicConnectTimeoutMs = viewModel.getQuicConnectTimeoutMs()
+        val savedForcePhysical = viewModel.getForcePhysicalOn()
 
         binding.run {
             e2eeEnabled.isChecked = e2EEOn
             e2eeKey.editText?.text = SpannableStringBuilder(e2EEKey)
             quicEnabled.isChecked = selectedPreset.useQuicSignal
+            forcePhysicalEnabled.isChecked = savedForcePhysical
             quicConnectTimeout.editText?.text = SpannableStringBuilder(savedQuicConnectTimeoutMs.toString())
             quicDeviceType.editText?.text = SpannableStringBuilder(savedQuicDeviceType.toString())
             quicCidTag.editText?.text = SpannableStringBuilder(savedQuicCidTag)
 
-            fun updateQuicConnectTimeoutVisibility(enabled: Boolean) {
-                quicConnectTimeout.visibility = if (enabled) View.VISIBLE else View.GONE
+            fun updateQuicControls() {
+                quicConnectTimeout.visibility = if (quicEnabled.isChecked) View.VISIBLE else View.GONE
+                forcePhysicalEnabled.isEnabled = quicEnabled.isChecked && selectedProxy() == null
+                if (!forcePhysicalEnabled.isEnabled) {
+                    forcePhysicalEnabled.isChecked = false
+                }
             }
 
-            updateQuicConnectTimeoutVisibility(quicEnabled.isChecked)
-            quicEnabled.setOnCheckedChangeListener { _, isChecked ->
-                updateQuicConnectTimeoutVisibility(isChecked)
+            updateQuicControls()
+            quicEnabled.setOnCheckedChangeListener { _, _ ->
+                updateQuicControls()
             }
 
             presetDropdown.setOnItemClickListener { _, _, position, _ ->
                 val preset = presets[position]
                 quicEnabled.isChecked = preset.useQuicSignal
+            }
+            rtcProxyDropdown.setOnItemClickListener { _, _, _, _ ->
+                updateQuicControls()
             }
 
             connectButton.setOnClickListener {
@@ -116,6 +125,7 @@ class MainActivity : AppCompatActivity() {
                             e2eeOn = e2eeEnabled.isChecked,
                             e2eeKey = e2eeKey.editText?.text.toString(),
                             quicOn = quicEnabled.isChecked,
+                            forcePhysical = forcePhysicalEnabled.isChecked,
                             quicDeviceType = quicDeviceTypeInt,
                             quicCidTag = quicCidTagStr,
                             quicConnectTimeoutMs = quicConnectTimeoutMs,
@@ -143,6 +153,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 viewModel.setSavedE2EEOn(e2eeEnabled.isChecked)
                 viewModel.setSavedE2EEKey(e2eeKey.editText?.text?.toString() ?: "")
+                viewModel.setForcePhysicalOn(forcePhysicalEnabled.isChecked)
                 viewModel.setQuicDeviceType(
                     quicDeviceType.editText?.text?.toString()?.toIntOrNull()
                         ?: MainViewModel.DEFAULT_QUIC_DEVICE_TYPE,
@@ -164,6 +175,7 @@ class MainActivity : AppCompatActivity() {
                 val defaultPreset = presets.first()
                 presetDropdown.setText(defaultPreset.label, false)
                 quicEnabled.isChecked = defaultPreset.useQuicSignal
+                forcePhysicalEnabled.isChecked = false
                 e2eeEnabled.isChecked = false
                 e2eeKey.editText?.text = SpannableStringBuilder("")
                 quicDeviceType.editText?.text =
@@ -173,6 +185,7 @@ class MainActivity : AppCompatActivity() {
                     SpannableStringBuilder(DEFAULT_QUIC_CONNECT_TIMEOUT_MS.toString())
                 quicConnectTimeout.error = null
                 rtcProxyDropdown.setText(MainViewModel.PROXY_LABEL_NONE, false)
+                updateQuicControls()
 
                 Toast.makeText(
                     this@MainActivity,

@@ -18,8 +18,6 @@ package io.livekit.android.room.network
 
 import android.net.ConnectivityManager
 import android.net.ConnectivityManager.NetworkCallback
-import android.net.NetworkCapabilities
-import android.net.NetworkRequest
 import io.livekit.android.util.LKLog
 import java.io.Closeable
 import java.util.concurrent.atomic.AtomicBoolean
@@ -32,13 +30,13 @@ typealias NetworkCallbackManagerFactory = @JvmSuppressWildcards (
  * @suppress
  */
 interface NetworkCallbackRegistry {
-    fun registerNetworkCallback(networkRequest: NetworkRequest, networkCallback: NetworkCallback)
+    fun registerDefaultNetworkCallback(networkCallback: NetworkCallback)
     fun unregisterNetworkCallback(networkCallback: NetworkCallback)
 }
 
 internal class NetworkCallbackRegistryImpl(val connectivityManager: ConnectivityManager) : NetworkCallbackRegistry {
-    override fun registerNetworkCallback(networkRequest: NetworkRequest, networkCallback: NetworkCallback) {
-        connectivityManager.registerNetworkCallback(networkRequest, networkCallback)
+    override fun registerDefaultNetworkCallback(networkCallback: NetworkCallback) {
+        connectivityManager.registerDefaultNetworkCallback(networkCallback)
     }
 
     override fun unregisterNetworkCallback(networkCallback: NetworkCallback) {
@@ -75,10 +73,7 @@ class NetworkCallbackManagerImpl(
     override fun registerCallback() {
         if (!isClosed.get() && isRegistered.compareAndSet(false, true)) {
             try {
-                val networkRequest = NetworkRequest.Builder()
-                    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                    .build()
-                connectivityManager.registerNetworkCallback(networkRequest, networkCallback)
+                connectivityManager.registerDefaultNetworkCallback(networkCallback)
             } catch (e: Exception) {
                 LKLog.w(e) { "Exception when trying to register network callback, reconnection may be impaired." }
             }

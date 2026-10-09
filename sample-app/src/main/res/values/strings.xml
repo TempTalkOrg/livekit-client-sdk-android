@@ -6,6 +6,7 @@
     <string name="e2ee_key_str">E2EE Key</string>
     <string name="e2ee_enabled_str">Enable E2EE</string>
     <string name="quic_enabled_str">Enable Quic Signal</string>
+    <string name="force_physical_enabled_str">Force QUIC onto physical network</string>
     <string name="quic_connect_timeout_ms_str">QUIC Connect Timeout (ms)</string>
     <string name="quic_device_type_str">QUIC Device Type</string>
     <string name="quic_cid_tag_str">QUIC CID Tag</string>

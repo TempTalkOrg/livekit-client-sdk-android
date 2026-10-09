@@ -57,6 +57,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun getE2EEOptionsOn() = preferences.getBoolean(PREFERENCES_KEY_E2EE_ON, false)
     fun getSavedE2EEKey() = preferences.getString(PREFERENCES_KEY_E2EE_KEY, E2EE_KEY) as String
     fun getQuicSignalOn() = preferences.getBoolean(PREFERENCES_KEY_QUIC_SIGNAL_ON, false)
+    fun getForcePhysicalOn() = preferences.getBoolean(PREFERENCES_KEY_FORCE_PHYSICAL_ON, false)
     fun getQuicDeviceType() = preferences.getInt(PREFERENCES_KEY_QUIC_DEVICE_TYPE, DEFAULT_QUIC_DEVICE_TYPE)
     fun getQuicCidTag() = preferences.getString(PREFERENCES_KEY_QUIC_CID_TAG, DEFAULT_QUIC_CID_TAG) ?: DEFAULT_QUIC_CID_TAG
     fun getQuicConnectTimeoutMs() =
@@ -113,6 +114,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun setForcePhysicalOn(yesno: Boolean) {
+        preferences.edit {
+            putBoolean(PREFERENCES_KEY_FORCE_PHYSICAL_ON, yesno)
+        }
+    }
+
     fun setQuicDeviceType(value: Int) {
         preferences.edit {
             putInt(PREFERENCES_KEY_QUIC_DEVICE_TYPE, value)
@@ -142,6 +149,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         private const val PREFERENCES_KEY_E2EE_ON = "enable_e2ee"
         private const val PREFERENCES_KEY_E2EE_KEY = "e2ee_key"
         private const val PREFERENCES_KEY_QUIC_SIGNAL_ON = "quic_signal_on"
+        private const val PREFERENCES_KEY_FORCE_PHYSICAL_ON = "force_physical_on"
         private const val PREFERENCES_KEY_QUIC_DEVICE_TYPE = "quic_device_type"
         private const val PREFERENCES_KEY_QUIC_CID_TAG = "quic_cid_tag"
         private const val PREFERENCES_KEY_QUIC_CONNECT_TIMEOUT_MS = "quic_connect_timeout_ms"

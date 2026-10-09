@@ -153,6 +153,7 @@ class CallViewModel(
     val e2ee: Boolean = false,
     val e2eeKey: String? = "",
     val quic: Boolean = false,
+    val forcePhysical: Boolean = false,
     val quicDeviceType: Int = 0,
     val quicCidTag: String = "",
     val serverHost: String = "",
@@ -189,6 +190,16 @@ class CallViewModel(
         val quicProxyPort = proxyConfig?.port ?: 0
         val quicProxySni = proxyConfig?.outerSni()
         val quicProxySpkiPin = proxyConfig?.spkiPinBase64
+        val physicalRoutingEnabled = quic && forcePhysical && proxyConfig == null
+        val physicalNetworkHandle = if (physicalRoutingEnabled) {
+            getApplication<Application>().findPhysicalNetworkHandle()
+        } else {
+            0
+        }
+        LKLog.i {
+            "[Sample] QUIC physical routing enabled=$physicalRoutingEnabled " +
+                "networkHandle=$physicalNetworkHandle"
+        }
 
         if (!BuildConfig.USE_MERGE_START_CALL || BuildConfig.MERGE_START_CALL_PARAM.isNullOrBlank()) {
             return ConnectOptions(
@@ -203,7 +214,9 @@ class CallViewModel(
                 quicProxyPort = quicProxyPort,
                 quicProxySni = quicProxySni,
                 quicProxySpkiPin = quicProxySpkiPin,
-            ).withQuicConnectTimeout(quicConnectTimeoutMs)
+            )
+                .withQuicConnectTimeout(quicConnectTimeoutMs)
+                .withPhysicalRouting(physicalRoutingEnabled, physicalNetworkHandle)
         }
         val param = Json.decodeFromString<MergeStartCallParam>(BuildConfig.MERGE_START_CALL_PARAM)
 
@@ -259,7 +272,9 @@ class CallViewModel(
             quicProxyPort = quicProxyPort,
             quicProxySni = quicProxySni,
             quicProxySpkiPin = quicProxySpkiPin,
-        ).withQuicConnectTimeout(quicConnectTimeoutMs)
+        )
+            .withQuicConnectTimeout(quicConnectTimeoutMs)
+            .withPhysicalRouting(physicalRoutingEnabled, physicalNetworkHandle)
     }
 
     private fun getRoomOptions(): RoomOptions {

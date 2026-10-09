@@ -99,6 +99,8 @@ class QuicTransport(
             proxySni = options.quicProxySni ?: ""
             proxyCaCertPem = options.quicProxyCaCertPem ?: ""
             spkiPin = options.quicProxySpkiPin ?: ""
+            vpnPolicy = if (options.forcePhysical) "force-physical" else ""
+            androidNetHandle = if (options.forcePhysical) options.physicalNetworkHandle else 0
             alpn = "ttsignal"
         }
 

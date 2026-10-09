@@ -17,12 +17,11 @@
 package io.livekit.android.test.mock
 
 import android.net.ConnectivityManager.NetworkCallback
-import android.net.NetworkRequest
 import io.livekit.android.room.network.NetworkCallbackRegistry
 
 class MockNetworkCallbackRegistry : NetworkCallbackRegistry {
     val networkCallbacks = mutableSetOf<NetworkCallback>()
-    override fun registerNetworkCallback(networkRequest: NetworkRequest, networkCallback: NetworkCallback) {
+    override fun registerDefaultNetworkCallback(networkCallback: NetworkCallback) {
         networkCallbacks.add(networkCallback)
     }
 

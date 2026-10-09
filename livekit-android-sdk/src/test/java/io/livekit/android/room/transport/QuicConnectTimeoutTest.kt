@@ -36,6 +36,18 @@ class QuicConnectTimeoutTest {
     }
 
     @Test
+    fun `connect options preserve physical routing through copy`() {
+        val options = ConnectOptions(
+            forcePhysical = true,
+            physicalNetworkHandle = 123456L,
+        )
+
+        assertEquals(true, options.forcePhysical)
+        assertEquals(123456L, options.physicalNetworkHandle)
+        assertEquals(options, options.copy())
+    }
+
+    @Test
     fun `existing positional arguments retain quic device type position`() {
         val options = ConnectOptions(
             true,

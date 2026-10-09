@@ -50,13 +50,22 @@
             android:id="@+id/e2ee_enabled"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="@string/e2ee_enabled_str" />
+            android:text="@string/e2ee_enabled_str"
+            android:textColor="@android:color/white" />
 
         <Switch
             android:id="@+id/quic_enabled"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="@string/quic_enabled_str" />
+            android:text="@string/quic_enabled_str"
+            android:textColor="@android:color/white" />
+
+        <Switch
+            android:id="@+id/force_physical_enabled"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/force_physical_enabled_str"
+            android:textColor="@android:color/white" />
 
         <com.google.android.material.textfield.TextInputLayout
             android:id="@+id/quic_connect_timeout"

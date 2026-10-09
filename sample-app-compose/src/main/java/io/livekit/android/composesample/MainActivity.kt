@@ -74,9 +74,10 @@ class MainActivity : ComponentActivity() {
                 defaultE2eeKey = viewModel.getSavedE2EEKey(),
                 defaultE2eeOn = viewModel.getE2EEOptionsOn(),
                 defaultQuicOn = viewModel.getQuicSignalOn(),
+                defaultForcePhysical = viewModel.getForcePhysicalOn(),
                 defaultQuicDeviceType = viewModel.getQuicDeviceType(),
                 defaultQuicCidTag = viewModel.getQuicCidTag(),
-                onConnect = { url, token, e2eeKey, e2eeOn, quicOn, quicDeviceType, quicCidTag, stressTest ->
+                onConnect = { url, token, e2eeKey, e2eeOn, quicOn, forcePhysical, quicDeviceType, quicCidTag, stressTest ->
                     val intent = Intent(this@MainActivity, CallActivity::class.java).apply {
                         putExtra(
                             CallActivity.KEY_ARGS,
@@ -86,6 +87,7 @@ class MainActivity : ComponentActivity() {
                                 e2eeKey,
                                 e2eeOn,
                                 quicOn,
+                                forcePhysical,
                                 quicDeviceType,
                                 quicCidTag,
                                 stressTest,
@@ -94,12 +96,13 @@ class MainActivity : ComponentActivity() {
                     }
                     startActivity(intent)
                 },
-                onSave = { url, token, e2eeKey, e2eeOn, quicOn, quicDeviceType, quicCidTag ->
+                onSave = { url, token, e2eeKey, e2eeOn, quicOn, forcePhysical, quicDeviceType, quicCidTag ->
                     viewModel.setSavedUrl(url)
                     viewModel.setSavedToken(token)
                     viewModel.setSavedE2EEKey(e2eeKey)
                     viewModel.setSavedE2EEOn(e2eeOn)
                     viewModel.setQuicSignalOn(quicOn)
+                    viewModel.setForcePhysicalOn(forcePhysical)
                     viewModel.setQuicDeviceType(quicDeviceType)
                     viewModel.setQuicCidTag(quicCidTag)
 
@@ -133,6 +136,7 @@ class MainActivity : ComponentActivity() {
         defaultE2eeKey: String = MainViewModel.E2EE_KEY,
         defaultE2eeOn: Boolean = false,
         defaultQuicOn: Boolean = false,
+        defaultForcePhysical: Boolean = false,
         defaultQuicDeviceType: Int = MainViewModel.DEFAULT_QUIC_DEVICE_TYPE,
         defaultQuicCidTag: String = MainViewModel.DEFAULT_QUIC_CID_TAG,
         onConnect: (
@@ -141,19 +145,21 @@ class MainActivity : ComponentActivity() {
             e2eeKey: String,
             e2eeOn: Boolean,
             quicOn: Boolean,
+            forcePhysical: Boolean,
             quicDeviceType: Int,
             quicCidTag: String,
             stressTest: StressTest,
-        ) -> Unit = { _, _, _, _, _, _, _, _ -> },
+        ) -> Unit = { _, _, _, _, _, _, _, _, _ -> },
         onSave: (
             url: String,
             token: String,
             e2eeKey: String,
             e2eeOn: Boolean,
             quicOn: Boolean,
+            forcePhysical: Boolean,
             quicDeviceType: Int,
             quicCidTag: String,
-        ) -> Unit = { _, _, _, _, _, _, _ -> },
+        ) -> Unit = { _, _, _, _, _, _, _, _ -> },
         onReset: () -> Unit = {},
     ) {
         AppTheme {
@@ -162,6 +168,7 @@ class MainActivity : ComponentActivity() {
             var e2eeKey by remember { mutableStateOf(defaultE2eeKey) }
             var e2eeOn by remember { mutableStateOf(defaultE2eeOn) }
             var quicOn by remember { mutableStateOf(defaultQuicOn) }
+            var forcePhysical by remember { mutableStateOf(defaultForcePhysical) }
             var quicDeviceType by remember { mutableStateOf(defaultQuicDeviceType.toString()) }
             var quicCidTag by remember { mutableStateOf(defaultQuicCidTag) }
             var stressTest by remember { mutableStateOf(false) }
@@ -246,9 +253,33 @@ class MainActivity : ComponentActivity() {
                             Text("Enable QUIC Signal")
                             Switch(
                                 checked = quicOn,
-                                onCheckedChange = { quicOn = it },
+                                onCheckedChange = {
+                                    quicOn = it
+                                    if (!it) forcePhysical = false
+                                },
                             )
                         }
+
+                        Spacer(modifier = Modifier.height(20.dp))
+                        Row(
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text("Force QUIC onto physical network")
+                            Switch(
+                                checked = forcePhysical,
+                                onCheckedChange = { forcePhysical = it },
+                                enabled = quicOn,
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = "Uses a non-VPN Wi-Fi, Ethernet, or cellular network. If none is available, QUIC fails closed and falls back to WebSocket.",
+                            style = MaterialTheme.typography.caption,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
 
                         Spacer(modifier = Modifier.height(8.dp))
                         Text(
@@ -304,6 +335,7 @@ class MainActivity : ComponentActivity() {
                                     e2eeKey,
                                     e2eeOn,
                                     quicOn,
+                                    forcePhysical,
                                     quicDeviceType.toIntOrNull() ?: 0,
                                     quicCidTag,
                                     stressTestCmd,
@@ -322,6 +354,7 @@ class MainActivity : ComponentActivity() {
                                     e2eeKey,
                                     e2eeOn,
                                     quicOn,
+                                    forcePhysical,
                                     quicDeviceType.toIntOrNull() ?: MainViewModel.DEFAULT_QUIC_DEVICE_TYPE,
                                     quicCidTag,
                                 )
@@ -339,6 +372,7 @@ class MainActivity : ComponentActivity() {
                                 e2eeKey = MainViewModel.E2EE_KEY
                                 e2eeOn = false
                                 quicOn = false
+                                forcePhysical = false
                                 quicDeviceType = MainViewModel.DEFAULT_QUIC_DEVICE_TYPE.toString()
                                 quicCidTag = MainViewModel.DEFAULT_QUIC_CID_TAG
                                 stressTest = false
