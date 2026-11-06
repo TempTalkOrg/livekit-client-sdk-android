@@ -1,0 +1,194 @@
+/*
+ * Copyright 2026 LiveKit, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package io.livekit.android.sample
+
+import android.app.Application
+import androidx.core.content.edit
+import androidx.lifecycle.AndroidViewModel
+import androidx.preference.PreferenceManager
+import io.livekit.android.sample.common.BuildConfig
+import kotlinx.serialization.json.Json
+
+class MainViewModel(application: Application) : AndroidViewModel(application) {
+
+    private val preferences = PreferenceManager.getDefaultSharedPreferences(application)
+
+    val presets: List<ConnectionPreset> = parsePresets()
+
+    val proxies: List<ProxyPreset> = parseProxies()
+
+    /** Saved [ConnectionPreset.key], falling back to the first preset. */
+    fun getSavedPresetKey(): String {
+        val savedKey = preferences.getString(PREFERENCES_KEY_PRESET_ID, null)
+        return if (savedKey != null && presets.any { it.key == savedKey }) {
+            savedKey
+        } else {
+            presets.firstOrNull()?.key ?: ""
+        }
+    }
+
+    fun setSavedPresetKey(key: String) {
+        preferences.edit {
+            putString(PREFERENCES_KEY_PRESET_ID, key)
+        }
+    }
+
+    fun getPresetByKey(key: String): ConnectionPreset? = presets.find { it.key == key }
+
+    fun getSelectedPreset(): ConnectionPreset {
+        return getPresetByKey(getSavedPresetKey()) ?: presets.first()
+    }
+
+    fun getSavedUrl() = preferences.getString(PREFERENCES_KEY_URL, URL) as String
+    fun getSavedToken() = preferences.getString(PREFERENCES_KEY_TOKEN, TOKEN) as String
+    fun getE2EEOptionsOn() = preferences.getBoolean(PREFERENCES_KEY_E2EE_ON, false)
+    fun getSavedE2EEKey() = preferences.getString(PREFERENCES_KEY_E2EE_KEY, E2EE_KEY) as String
+    fun getQuicSignalOn() = preferences.getBoolean(PREFERENCES_KEY_QUIC_SIGNAL_ON, false)
+    fun getForcePhysicalOn() = preferences.getBoolean(PREFERENCES_KEY_FORCE_PHYSICAL_ON, false)
+    fun getQuicDeviceType() = preferences.getInt(PREFERENCES_KEY_QUIC_DEVICE_TYPE, DEFAULT_QUIC_DEVICE_TYPE)
+    fun getQuicCidTag() = preferences.getString(PREFERENCES_KEY_QUIC_CID_TAG, DEFAULT_QUIC_CID_TAG) ?: DEFAULT_QUIC_CID_TAG
+    fun getQuicConnectTimeoutMs() =
+        preferences.getInt(PREFERENCES_KEY_QUIC_CONNECT_TIMEOUT_MS, DEFAULT_QUIC_CONNECT_TIMEOUT_MS)
+
+    /** Selected RTC proxy id, or [PROXY_ID_NONE] when media should not be relayed. */
+    fun getSavedProxyId(): String {
+        val savedId = preferences.getString(PREFERENCES_KEY_RTC_PROXY_ID, PROXY_ID_NONE)
+        return if (savedId == PROXY_ID_NONE || proxies.any { it.id == savedId }) {
+            savedId ?: PROXY_ID_NONE
+        } else {
+            PROXY_ID_NONE
+        }
+    }
+
+    fun getProxyById(id: String): ProxyPreset? = proxies.find { it.id == id }
+
+    /** The currently selected proxy, or null when "No Proxy" is selected. */
+    fun getSelectedProxy(): ProxyPreset? = getProxyById(getSavedProxyId())
+
+    fun setSavedProxyId(id: String) {
+        preferences.edit {
+            putString(PREFERENCES_KEY_RTC_PROXY_ID, id)
+        }
+    }
+
+    fun setSavedUrl(url: String) {
+        preferences.edit {
+            putString(PREFERENCES_KEY_URL, url)
+        }
+    }
+
+    fun setSavedToken(token: String) {
+        preferences.edit {
+            putString(PREFERENCES_KEY_TOKEN, token)
+        }
+    }
+
+    fun setSavedE2EEOn(yesno: Boolean) {
+        preferences.edit {
+            putBoolean(PREFERENCES_KEY_E2EE_ON, yesno)
+        }
+    }
+
+    fun setSavedE2EEKey(key: String) {
+        preferences.edit {
+            putString(PREFERENCES_KEY_E2EE_KEY, key)
+        }
+    }
+
+    fun setQuicSignalOn(yesno: Boolean) {
+        preferences.edit {
+            putBoolean(PREFERENCES_KEY_QUIC_SIGNAL_ON, yesno)
+        }
+    }
+
+    fun setForcePhysicalOn(yesno: Boolean) {
+        preferences.edit {
+            putBoolean(PREFERENCES_KEY_FORCE_PHYSICAL_ON, yesno)
+        }
+    }
+
+    fun setQuicDeviceType(value: Int) {
+        preferences.edit {
+            putInt(PREFERENCES_KEY_QUIC_DEVICE_TYPE, value)
+        }
+    }
+
+    fun setQuicCidTag(value: String) {
+        preferences.edit {
+            putString(PREFERENCES_KEY_QUIC_CID_TAG, value)
+        }
+    }
+
+    fun setQuicConnectTimeoutMs(value: Int) {
+        preferences.edit {
+            putInt(PREFERENCES_KEY_QUIC_CONNECT_TIMEOUT_MS, value)
+        }
+    }
+
+    fun reset() {
+        preferences.edit { clear() }
+    }
+
+    companion object {
+        private const val PREFERENCES_KEY_URL = "url"
+        private const val PREFERENCES_KEY_TOKEN = "token"
+        private const val PREFERENCES_KEY_PRESET_ID = "preset_id"
+        private const val PREFERENCES_KEY_E2EE_ON = "enable_e2ee"
+        private const val PREFERENCES_KEY_E2EE_KEY = "e2ee_key"
+        private const val PREFERENCES_KEY_QUIC_SIGNAL_ON = "quic_signal_on"
+        private const val PREFERENCES_KEY_FORCE_PHYSICAL_ON = "force_physical_on"
+        private const val PREFERENCES_KEY_QUIC_DEVICE_TYPE = "quic_device_type"
+        private const val PREFERENCES_KEY_QUIC_CID_TAG = "quic_cid_tag"
+        private const val PREFERENCES_KEY_QUIC_CONNECT_TIMEOUT_MS = "quic_connect_timeout_ms"
+        private const val PREFERENCES_KEY_RTC_PROXY_ID = "rtc_proxy_id"
+
+        /** Sentinel proxy id meaning "do not relay media through any proxy". */
+        const val PROXY_ID_NONE = "none"
+        const val PROXY_LABEL_NONE = "No Proxy"
+
+        const val URL = BuildConfig.DEFAULT_URL
+        const val TOKEN = BuildConfig.DEFAULT_TOKEN
+        const val E2EE_KEY = "12345678"
+        val DEFAULT_QUIC_DEVICE_TYPE: Int = BuildConfig.DEFAULT_QUIC_DEVICE_TYPE
+        val DEFAULT_QUIC_CID_TAG: String = BuildConfig.DEFAULT_QUIC_CID_TAG
+
+        private val json = Json { ignoreUnknownKeys = true }
+
+        private fun parsePresets(): List<ConnectionPreset> {
+            return try {
+                json.decodeFromString<List<ConnectionPreset>>(BuildConfig.SAMPLE_PRESETS_JSON)
+            } catch (_: Exception) {
+                listOf(
+                    ConnectionPreset(
+                        id = "default",
+                        label = "Default",
+                        url = URL,
+                        token = TOKEN,
+                    ),
+                )
+            }
+        }
+
+        private fun parseProxies(): List<ProxyPreset> {
+            return try {
+                json.decodeFromString<List<ProxyPreset>>(BuildConfig.SAMPLE_PROXIES_JSON)
+            } catch (_: Exception) {
+                emptyList()
+            }
+        }
+    }
+}

@@ -1,0 +1,289 @@
+/*
+ * Copyright 2025-2026 LiveKit, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package io.livekit.android.room.transport
+
+import android.net.Uri
+import io.livekit.android.ConnectOptions
+import io.livekit.android.util.LKLog
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import okio.ByteString
+import okio.ByteString.Companion.toByteString
+import org.example.android.smp.Config
+import org.example.android.smp.Connection
+import org.example.android.smp.Connector
+import org.example.android.smp.Const
+import org.example.android.smp.IConnectionHandler
+import org.example.android.smp.Stream
+import java.nio.ByteBuffer
+import java.nio.charset.Charset
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+
+internal const val DEFAULT_QUIC_CONNECT_TIMEOUT_MS = 7000
+private const val MIN_QUIC_CONNECT_TIMEOUT_MS = 1000
+private const val MAX_QUIC_CONNECT_TIMEOUT_MS = 15000
+
+internal fun normalizeQuicConnectTimeoutMs(value: Int): Int =
+    if (value in MIN_QUIC_CONNECT_TIMEOUT_MS..MAX_QUIC_CONNECT_TIMEOUT_MS) {
+        value
+    } else {
+        DEFAULT_QUIC_CONNECT_TIMEOUT_MS
+    }
+
+/**
+ * A single-thread executor for one transport's callbacks. The thread factory captures only the
+ * name: if it captured the transport, the idle thread would keep the transport (and the Room
+ * behind its listener) reachable, so the executor's own finalizer could never shut it down.
+ */
+internal fun newCallbackExecutor(threadName: String): ExecutorService =
+    Executors.newSingleThreadExecutor { r -> Thread(r, threadName).apply { isDaemon = true } }
+
+class QuicTransport internal constructor(
+    override val attemptId: Long,
+    override val sendOnOpen: ByteString?,
+    // A function instead of the Connector itself so tests can run without libsignal.so.
+    private val createConnection: (Config, IConnectionHandler) -> Connection?,
+) : SignalTransport {
+    constructor(
+        attemptId: Long,
+        sendOnOpen: ByteString?,
+        connector: Connector,
+    ) : this(attemptId, sendOnOpen, connector::createConnection)
+
+    private var connection: Connection? = null
+    private var stream: Stream? = null
+    private var listener: SignalTransport.Listener? = null
+
+    private val lock = Any()
+
+    private val listenerExecutor: ExecutorService =
+        newCallbackExecutor("QuicTransport-Listener-Thread-$attemptId")
+
+    companion object {
+        init {
+            try {
+                System.loadLibrary("signal")
+            } catch (e: UnsatisfiedLinkError) {
+                LKLog.e(e) { "Failed to load ttsignaljni library." }
+            }
+        }
+    }
+
+    override fun connect(
+        url: String,
+        token: String,
+        options: ConnectOptions,
+        listener: SignalTransport.Listener,
+    ) {
+        this.listener = listener
+        val uri = Uri.parse(url)
+
+        val config = Config().apply {
+            idleTimeOut = 14000
+            pingInterval = 7000
+            hostname = uri.host
+            port = if (uri.port != -1) uri.port else 443
+            maxConnections = 1
+            congestCtrl = Const.CC_BBR2
+            pingOn = true
+            deviceType = options.quicDeviceType
+            cidTag = options.quicCidTag
+            serverHost = options.serverHost ?: hostname
+            caCertPem = options.caCertPem ?: ""
+            proxyUrl = options.quicProxyUrl ?: ""
+            proxyHost = options.quicProxyHost ?: ""
+            proxyPort = options.quicProxyPort
+            proxySni = options.quicProxySni ?: ""
+            proxyCaCertPem = options.quicProxyCaCertPem ?: ""
+            spkiPin = options.quicProxySpkiPin ?: ""
+            vpnPolicy = if (options.forcePhysical) "force-physical" else ""
+            androidNetHandle = if (options.forcePhysical) options.physicalNetworkHandle else 0
+            alpn = "ttsignal"
+        }
+
+        val connectionHandler = object : IConnectionHandler {
+            override fun onConnectResult(conn: Connection?, errorCode: Int, message: String?) {
+                LKLog.i { "[quic] onConnectResult: $errorCode, $message, ${this@QuicTransport}" }
+                executeOnListenerThread {
+                    if (errorCode == 0) {
+                        synchronized(lock) {
+                            this@QuicTransport.connection = conn
+                        }
+                    } else {
+                        listener.onFailure(this@QuicTransport, TtsignalException("Connection failed: $message", errorCode), null)
+                    }
+                }
+            }
+
+            override fun onStreamCreated(conn: Connection?, stream: Stream) {
+                LKLog.i { "[quic] onStreamCreated: ${stream.id()}, ${this@QuicTransport}" }
+                executeOnListenerThread {
+                    synchronized(lock) {
+                        this@QuicTransport.stream = stream
+                    }
+                    listener.onOpen(this@QuicTransport)
+                }
+            }
+
+            override fun onStreamClosed(conn: Connection?, stream: Stream) {
+                LKLog.i { "[quic] onStreamClosed: ${stream.id()}, ${this@QuicTransport}" }
+                executeOnListenerThread {
+                    synchronized(lock) {
+                        if (this@QuicTransport.stream?.id() == stream.id()) {
+                            this@QuicTransport.stream = null
+                        }
+                    }
+                }
+            }
+
+            override fun onRecvCmd(conn: Connection?, timestamp: Long, transId: Int, stream: Stream?, buffer: ByteArray) {
+                val cmd = Charset.forName("UTF-8").decode(ByteBuffer.wrap(buffer)).toString()
+                LKLog.v { "CLI command content: $cmd, ${this@QuicTransport}" }
+            }
+
+            override fun onRecvData(conn: Connection?, timestamp: Long, transId: Int, stream: Stream?, buffer: ByteArray) {
+                executeOnListenerThread {
+                    listener.onMessage(this@QuicTransport, buffer.toByteString())
+                }
+            }
+
+            override fun onRestart(conn: Connection?, result: Int, address: String?) {
+                LKLog.i { "[quic] Restart result: $result, address: $address, ${this@QuicTransport}" }
+                executeOnListenerThread {
+                    listener.onRestarted(this@QuicTransport, result, address)
+                }
+            }
+
+            override fun onClosed(conn: Connection?, reason: String?) {
+                LKLog.i { "[quic] onClosed: $reason, ${this@QuicTransport}" }
+                executeOnListenerThread {
+                    try {
+                        listener.onClosed(this@QuicTransport, 1000, reason ?: "Connection closed")
+                    } finally {
+                        synchronized(lock) {
+                            cleanup()
+                        }
+                        // Native sends nothing after onClosed (it drops its handler right after),
+                        // so this thread is done. Not close()/cancel(): their onClosed still has to
+                        // come through here, e.g. SignalClient reconnects on it after a ping timeout.
+                        listenerExecutor.shutdown()
+                    }
+                }
+            }
+
+            override fun onException(conn: Connection?, errorMsg: String?) {
+                LKLog.e { "[quic] onException: $errorMsg, ${this@QuicTransport}" }
+                executeOnListenerThread {
+                    listener.onFailure(this@QuicTransport, TtsignalException(errorMsg ?: "Unknown ttsignal exception"), null)
+                    synchronized(lock) {
+                        cleanup()
+                    }
+                }
+            }
+        }
+
+        this.connection = createConnection(config, connectionHandler)
+
+        val authObject = buildJsonObject {
+            if (token.isNotEmpty()) {
+                put("Authorization", "Bearer $token")
+            }
+            options.userAgent?.let { userAgent ->
+                if (userAgent.isNotEmpty()) {
+                    put("User-Agent", userAgent)
+                }
+            }
+        }
+
+        val host = url.replaceFirst("wss", "https")
+        val props = authObject.toString()
+        val effectiveTimeoutMs = normalizeQuicConnectTimeoutMs(options.quicConnectTimeoutMs)
+        if (effectiveTimeoutMs != options.quicConnectTimeoutMs) {
+            LKLog.w {
+                "[quic] Invalid connect timeout ${options.quicConnectTimeoutMs}ms; " +
+                    "using ${DEFAULT_QUIC_CONNECT_TIMEOUT_MS}ms."
+            }
+        }
+        LKLog.i {
+            "[quic] connect: alpn=${config.serverHost}, url=[$host], " +
+                "timeoutMs=$effectiveTimeoutMs, ${this@QuicTransport}"
+        }
+        this.connection?.connect(host, props, effectiveTimeoutMs)
+    }
+
+    override fun send(data: ByteString): Boolean {
+        synchronized(lock) {
+            val stream = this.stream ?: return false.also { LKLog.w { "send called but stream is not available., ${this@QuicTransport}" } }
+            val bytes = data.toByteArray()
+            return stream.sendData(bytes) == 0
+        }
+    }
+
+    override fun close(code: Int, reason: String) {
+        executeOnListenerThread {
+            LKLog.i { "[quic] close connection..., ${this@QuicTransport}" }
+            synchronized(lock) {
+                connection?.close()
+                cleanup()
+            }
+        }
+    }
+
+    override fun cancel() {
+        executeOnListenerThread {
+            LKLog.i { "[quic] cancel connection..., ${this@QuicTransport}" }
+            synchronized(lock) {
+                connection?.close()
+                cleanup()
+            }
+        }
+    }
+
+    override fun restart(networkHandle: Long) {
+        synchronized(lock) {
+            val conn = connection ?: return
+            LKLog.i { "[quic] restart with networkHandle=$networkHandle, ${this@QuicTransport}" }
+            conn.restart(networkHandle)
+        }
+    }
+
+    private fun cleanup() {
+        connection = null
+        stream = null
+    }
+
+    override fun toString(): String {
+        return "${javaClass.simpleName}@${Integer.toHexString(hashCode())}(attemptId=$attemptId)"
+    }
+
+    private fun executeOnListenerThread(block: () -> Unit) {
+        try {
+            if (!listenerExecutor.isShutdown) {
+                listenerExecutor.execute(block)
+            } else {
+                // Expected once native has closed the connection, e.g. a cancel() that comes later.
+                LKLog.d { "[quic] listener executor is shut down, dropping callback, ${this@QuicTransport}" }
+            }
+        } catch (e: RejectedExecutionException) {
+            LKLog.w(e) { "Failed to execute callback on listener thread." }
+        }
+    }
+}
+
+class TtsignalException(message: String, val errorCode: Int? = null) : Exception(message)

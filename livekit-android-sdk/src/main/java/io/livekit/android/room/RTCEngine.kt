@@ -1,0 +1,2093 @@
+/*
+ * Copyright 2023-2026 LiveKit, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package io.livekit.android.room
+
+import android.os.SystemClock
+import androidx.annotation.CheckResult
+import androidx.annotation.VisibleForTesting
+import com.google.protobuf.ByteString
+import com.vdurmont.semver4j.Semver
+import io.livekit.android.ConnectOptions
+import io.livekit.android.RoomOptions
+import io.livekit.android.dagger.InjectionNames
+import io.livekit.android.e2ee.DataPacketCryptorManager
+import io.livekit.android.e2ee.E2EEManager
+import io.livekit.android.e2ee.EncryptedPacket
+import io.livekit.android.events.DisconnectReason
+import io.livekit.android.events.convert
+import io.livekit.android.room.network.DefaultReconnectPolicy
+import io.livekit.android.room.network.ReconnectContext
+import io.livekit.android.room.network.ReconnectPolicy
+import io.livekit.android.room.participant.Participant
+import io.livekit.android.room.participant.ParticipantTrackPermission
+import io.livekit.android.room.track.TrackException
+import io.livekit.android.room.util.MediaConstraintKeys
+import io.livekit.android.room.util.createAnswer
+import io.livekit.android.room.util.setLocalDescription
+import io.livekit.android.room.util.waitUntilConnected
+import io.livekit.android.util.CloseableCoroutineScope
+import io.livekit.android.util.Either
+import io.livekit.android.util.FlowObservable
+import io.livekit.android.util.LKLog
+import io.livekit.android.util.TTLMap
+import io.livekit.android.util.flow
+import io.livekit.android.util.flowDelegate
+import io.livekit.android.util.nullSafe
+import io.livekit.android.util.rethrowIfCancellationSignal
+import io.livekit.android.util.withCheckLock
+import io.livekit.android.util.withDeadline
+import io.livekit.android.webrtc.DataChannelManager
+import io.livekit.android.webrtc.DataPacketBuffer
+import io.livekit.android.webrtc.DataPacketItem
+import io.livekit.android.webrtc.RTCStatsGetter
+import io.livekit.android.webrtc.copy
+import io.livekit.android.webrtc.isConnected
+import io.livekit.android.webrtc.isDisconnected
+import io.livekit.android.webrtc.peerconnection.RTCThreadToken
+import io.livekit.android.webrtc.peerconnection.executeBlockingOnRTCThread
+import io.livekit.android.webrtc.peerconnection.launchBlockingOnRTCThread
+import io.livekit.android.webrtc.toProtoSessionDescription
+import kotlinx.coroutines.CancellableContinuation
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.yield
+import livekit.LivekitModels
+import livekit.LivekitModels.AudioTrackFeature
+import livekit.LivekitRtc
+import livekit.LivekitRtc.JoinResponse
+import livekit.LivekitRtc.LeaveRequest
+import livekit.LivekitRtc.ReconnectResponse
+import livekit.org.webrtc.DataChannel
+import livekit.org.webrtc.IceCandidate
+import livekit.org.webrtc.MediaConstraints
+import livekit.org.webrtc.MediaStream
+import livekit.org.webrtc.MediaStreamTrack
+import livekit.org.webrtc.PeerConnection
+import livekit.org.webrtc.PeerConnection.PeerConnectionState
+import livekit.org.webrtc.PeerConnection.RTCConfiguration
+import livekit.org.webrtc.RTCStatsCollectorCallback
+import livekit.org.webrtc.RTCStatsReport
+import livekit.org.webrtc.RtpReceiver
+import livekit.org.webrtc.RtpSender
+import livekit.org.webrtc.RtpTransceiver
+import livekit.org.webrtc.RtpTransceiver.RtpTransceiverInit
+import livekit.org.webrtc.SessionDescription
+import java.nio.ByteBuffer
+import javax.inject.Inject
+import javax.inject.Named
+import javax.inject.Singleton
+import kotlin.coroutines.Continuation
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
+
+/**
+ * @suppress
+ */
+@Singleton
+class RTCEngine
+@Inject
+internal constructor(
+    val client: SignalClient,
+    private val pctFactory: PeerConnectionTransport.Factory,
+    @Named(InjectionNames.DISPATCHER_IO)
+    private val ioDispatcher: CoroutineDispatcher,
+    private val rtcThreadToken: RTCThreadToken,
+    private val dataPacketCryptorFactory: DataPacketCryptorManager.Factory,
+) : SignalClient.Listener {
+    internal var listener: Listener? = null
+
+    /**
+     * Reflects the combined connection state of SignalClient and primary PeerConnection.
+     */
+    @FlowObservable
+    @get:FlowObservable
+    var connectionState: ConnectionState by flowDelegate(ConnectionState.DISCONNECTED) { newVal, oldVal ->
+        if (newVal == oldVal) {
+            return@flowDelegate
+        }
+        when (newVal) {
+            ConnectionState.CONNECTED -> {
+                if (oldVal == ConnectionState.DISCONNECTED || oldVal == ConnectionState.CONNECTING) {
+                    LKLog.d { "primary ICE connected" }
+                    listener?.onEngineConnected()
+                } else if (oldVal == ConnectionState.RECONNECTING) {
+                    LKLog.d { "primary ICE reconnected" }
+                    listener?.onEngineReconnected()
+                } else if (oldVal == ConnectionState.RESUMING) {
+                    listener?.onEngineResumed()
+                }
+            }
+
+            ConnectionState.DISCONNECTED -> {
+                LKLog.d { "primary ICE disconnected" }
+                // An intentional teardown (close()/disconnect()) also drives the ICE
+                // state to DISCONNECTED. That is not a connection loss and must not
+                // request a reconnect. close() sets isClosed=true before it flips
+                // connectionState, so this guard reliably distinguishes the two.
+                if (oldVal == ConnectionState.CONNECTED && !isClosed) {
+                    listener?.onEngineConnectionLost("primary ICE disconnected")
+                }
+            }
+
+            else -> {
+            }
+        }
+    }
+
+    @Volatile
+    internal var reconnectType: ReconnectType = ReconnectType.DEFAULT
+    private var reconnectingJob: Job? = null
+
+    @Volatile
+    private var pendingNetworkHandle: Long = 0
+
+    @Volatile
+    private var restartContinuation: CancellableContinuation<Boolean>? = null
+
+    @Volatile
+    private var fullReconnectOnNext = false
+
+    internal var reconnectPolicy: ReconnectPolicy = DefaultReconnectPolicy()
+
+    private val pendingTrackResolvers: MutableMap<String, Continuation<LivekitModels.TrackInfo>> =
+        mutableMapOf()
+
+    internal var regionUrlProvider: RegionUrlProvider? = null
+    private var sessionUrl: String? = null
+    private var sessionToken: String? = null
+    private var connectOptions: ConnectOptions? = null
+    private var lastRoomOptions: RoomOptions? = null
+    private var participantSid: String? = null
+
+    internal val serverVersion: Semver?
+        get() = client.serverVersion
+
+    internal val serverInfo: ServerInfo?
+        get() = client.serverInfo
+
+    private var publisherObserver: PublisherTransportObserver? = null
+    private var subscriberObserver: SubscriberTransportObserver? = null
+
+    internal var publisher: PeerConnectionTransport? = null
+    private var subscriber: PeerConnectionTransport? = null
+
+    private var reliableDataChannel: DataChannel? = null
+    private var reliableDataChannelSub: DataChannel? = null
+    private var lossyDataChannel: DataChannel? = null
+    private var lossyDataChannelSub: DataChannel? = null
+    private var reliableDataChannelManager: DataChannelManager? = null
+    private var reliableBufferedAmountJob: Job? = null
+    private var reliableDataChannelSubManager: DataChannelManager? = null
+    private var lossyDataChannelManager: DataChannelManager? = null
+    private var lossyDataChannelSubManager: DataChannelManager? = null
+
+    private val reliableStateLock = Object()
+    private var reliableDataSequence: Int = 1
+    private val reliableMessageBuffer = DataPacketBuffer(RELIABLE_RETRY_AMOUNT)
+    private val reliableReceivedState = TTLMap<String, Int>(RELIABLE_RECEIVE_STATE_TTL_MS)
+
+    @FlowObservable
+    @get:FlowObservable
+    internal var isSubscriberPrimary: Boolean by flowDelegate(false)
+        private set
+
+    @Volatile
+    private var isClosed = true
+
+    /**
+     * True while [Room.connect] is establishing the first session. While set, the
+     * outcome belongs to [waitForInitialPCConnection]: the room must not emit Connected
+     * on primary ICE connected, nor start an in-session reconnect on connection loss.
+     */
+    @Volatile
+    internal var isInitialConnect = false
+
+    /**
+     * Monotonically increasing id bumped once per fresh connection session started
+     * via [join]. It is used to drop stale disconnect callbacks that belong to a
+     * previous session.
+     *
+     * Concretely: on a manual server switch the app does `disconnect()` (old node)
+     * immediately followed by `connect()` (new node). The old session's server
+     * `leave` response can arrive asynchronously and reach [onLeave] while the new
+     * session is already being established. Since [close] performs a blocking RTC
+     * thread teardown, the resulting [Listener.onEngineDisconnected] can fire after
+     * the new [join] has begun and would otherwise tear the new session down.
+     * Comparing the generation captured when the leave was received against the
+     * current one lets us discard such stale disconnects.
+     *
+     * Internal reconnects deliberately go through [joinImpl] and keep the same
+     * generation, so a disconnect during an in-session reconnect is still honored.
+     */
+    @Volatile
+    private var sessionGeneration = 0L
+
+    /**
+     * Set by [onLeave] while [isInitialConnect]; [waitForInitialPCConnection] throws it
+     * if it belongs to the current [sessionGeneration].
+     */
+    @Volatile
+    private var initialConnectLeaveError: Pair<Long, Throwable>? = null
+
+    @FlowObservable
+    @get:FlowObservable
+    internal var hasPublished: Boolean by flowDelegate(false)
+        private set
+
+    /**
+     * Latest publisher PeerConnection state used to derive [MediaSendConnectionState].
+     * Null when no publisher observer is active.
+     */
+    @FlowObservable
+    @get:FlowObservable
+    internal var publisherConnectionState: PeerConnection.PeerConnectionState? by flowDelegate(null)
+        private set
+
+    /**
+     * Whether the publisher PeerConnection has reached CONNECTED in this room session.
+     */
+    @FlowObservable
+    @get:FlowObservable
+    internal var hasPublisherEverConnected: Boolean by flowDelegate(false)
+        private set
+
+    private var coroutineScope = CloseableCoroutineScope(SupervisorJob() + ioDispatcher)
+
+    internal var e2EEManager: E2EEManager? = null
+    private val dataPacketCryptorManager: DataPacketCryptorManager?
+        get() = e2EEManager?.dataPacketCryptorManager
+
+    /**
+     * Note: If this lock is ever used in conjunction with the RTC thread,
+     * this must be grabbed on the RTC thread to prevent deadlocks.
+     */
+    private var configurationLock = Mutex()
+
+    /**
+     * Prevents concurrent publisher negotiations which can cause ICE gathering
+     * race conditions and connection failures.
+     */
+    private val negotiatePublisherMutex = Mutex()
+
+    init {
+        client.listener = this
+    }
+
+    private fun createPublisherObserver(): PublisherTransportObserver {
+        return PublisherTransportObserver(this, client, rtcThreadToken)
+    }
+
+    private fun createSubscriberObserver(): SubscriberTransportObserver {
+        return SubscriberTransportObserver(this, client, rtcThreadToken)
+    }
+
+    suspend fun join(
+        url: String,
+        token: String,
+        options: ConnectOptions,
+        roomOptions: RoomOptions,
+    ): JoinResponse {
+        // Mark the start of a new session so that any stale disconnect callback from
+        // the previous session (e.g. a late server `leave` response) can be discarded.
+        sessionGeneration++
+        hasPublisherEverConnected = false
+        coroutineScope.close()
+        coroutineScope = CloseableCoroutineScope(SupervisorJob() + ioDispatcher)
+        sessionUrl = url
+        sessionToken = token
+        connectOptions = options
+        lastRoomOptions = roomOptions
+        return joinImpl(url, token, options, roomOptions)
+    }
+
+    suspend fun joinImpl(
+        url: String,
+        token: String,
+        options: ConnectOptions,
+        roomOptions: RoomOptions,
+    ): JoinResponse = coroutineScope {
+        if (connectionState == ConnectionState.DISCONNECTED) {
+            connectionState = ConnectionState.CONNECTING
+        }
+
+        LKLog.i { "[reconnect][signal] joinImpl signal connect in." }
+        val joinResponse = client.join(url, token, options, roomOptions)
+        LKLog.i { "[reconnect][signal] joinImpl signal connect out." }
+        ensureActive()
+
+        listener?.onJoinResponse(joinResponse)
+        isClosed = false
+        listener?.onSignalConnected(false)
+
+        isSubscriberPrimary = joinResponse.subscriberPrimary
+
+        configure(joinResponse, options)
+
+        // create offer
+        if (!isSubscriberPrimary || joinResponse.fastPublish) {
+            negotiatePublisher()
+        }
+        client.onReadyForResponses()
+
+        LKLog.i { "[reconnect][signal] joinImpl out." }
+
+        return@coroutineScope joinResponse
+    }
+
+    private suspend fun configure(joinResponse: JoinResponse, connectOptions: ConnectOptions) {
+        launchBlockingOnRTCThread(rtcThreadToken) {
+            configurationLock.withCheckLock(
+                {
+                    ensureActive()
+                    if (publisher != null && subscriber != null) {
+                        // already configured
+                        return@launchBlockingOnRTCThread
+                    }
+                },
+            ) {
+                participantSid = if (joinResponse.hasParticipant()) {
+                    joinResponse.participant.sid
+                } else {
+                    null
+                }
+
+                // Setup peer connections
+                val rtcConfig = makeRTCConfig(Either.Left(joinResponse), connectOptions)
+
+                val newPublisherObserver = createPublisherObserver()
+                val newSubscriberObserver = createSubscriberObserver()
+
+                publisher?.close()
+                val newPublisher = pctFactory.create(
+                    rtcConfig,
+                    newPublisherObserver,
+                    newPublisherObserver,
+                    connectOptions.sslCertificateVerifier,
+                )
+                subscriber?.close()
+                val newSubscriber = pctFactory.create(
+                    rtcConfig,
+                    newSubscriberObserver,
+                    null,
+                    connectOptions.sslCertificateVerifier,
+                )
+                publisher = newPublisher
+                subscriber = newSubscriber
+                publisherObserver = newPublisherObserver
+                subscriberObserver = newSubscriberObserver
+                publisherConnectionState = newPublisherObserver.connectionState
+
+                val connectionStateListener: PeerConnectionStateListener = { newState, tag ->
+                    val tagL = "listener${Integer.toHexString(System.identityHashCode(this))}"
+
+                    LKLog.v { "[$tagL, $tag] onIceConnection new state: $newState" }
+                    if (newState.isConnected()) {
+                        connectionState = ConnectionState.CONNECTED
+                    } else if (newState.isDisconnected()) {
+                        if (connectionState == ConnectionState.RECONNECTING || connectionState == ConnectionState.RESUMING) {
+                            LKLog.d { "[$tagL, $tag] ignoring disconnected state while $connectionState" }
+                        } else {
+                            connectionState = ConnectionState.DISCONNECTED
+                        }
+                    }
+                }
+
+                if (joinResponse.subscriberPrimary) {
+                    // in subscriber primary mode, server side opens sub data channels.
+                    newSubscriberObserver.dataChannelListener = onDataChannel@{ dataChannel: DataChannel ->
+                        when (dataChannel.label()) {
+                            RELIABLE_DATA_CHANNEL_LABEL -> reliableDataChannelSub = dataChannel
+                            LOSSY_DATA_CHANNEL_LABEL -> lossyDataChannelSub = dataChannel
+                            else -> return@onDataChannel
+                        }
+                        dataChannel.registerObserver(DataChannelObserver(dataChannel))
+                    }
+
+                    newSubscriberObserver.connectionChangeListener = connectionStateListener
+                    // Also reconnect on publisher disconnect
+                    newPublisherObserver.connectionChangeListener = { newState, tag ->
+                        if (newState.isDisconnected()) {
+                            val tagL = "listener${Integer.toHexString(System.identityHashCode(this))}"
+                            LKLog.i { "[$tagL, $tag] publisher disconnected" }
+                            listener?.onEngineConnectionLost("publisher disconnected")
+                        }
+                    }
+                } else {
+                    newPublisherObserver.connectionChangeListener = connectionStateListener
+                }
+
+                // Mirror publisher PeerConnection state for MediaSendConnectionState.
+                coroutineScope.launch {
+                    newPublisherObserver::connectionState.flow.collect { pcState ->
+                        if (publisherObserver === newPublisherObserver) {
+                            publisherConnectionState = pcState
+                            if (pcState == PeerConnection.PeerConnectionState.CONNECTED) {
+                                hasPublisherEverConnected = true
+                            }
+                        }
+                    }
+                }
+
+                ensureActive()
+                // data channels
+                val reliableInit = DataChannel.Init()
+                reliableInit.ordered = true
+                reliableDataChannel = publisher?.withPeerConnection {
+                    createDataChannel(
+                        RELIABLE_DATA_CHANNEL_LABEL,
+                        reliableInit,
+                    ).also { dataChannel ->
+
+                        val dataChannelManager = DataChannelManager(dataChannel, DataChannelObserver(dataChannel), rtcThreadToken)
+                        reliableDataChannelManager = dataChannelManager
+                        dataChannel.registerObserver(dataChannelManager)
+                        reliableBufferedAmountJob?.cancel()
+                        reliableBufferedAmountJob = coroutineScope.launch {
+                            dataChannelManager::bufferedAmount.flow.collect { bufferedAmount ->
+                                synchronized(reliableStateLock) {
+                                    reliableMessageBuffer.trim(bufferedAmount)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                ensureActive()
+                val lossyInit = DataChannel.Init()
+                lossyInit.ordered = false
+                lossyInit.maxRetransmits = 0
+                lossyDataChannel = publisher?.withPeerConnection {
+                    createDataChannel(
+                        LOSSY_DATA_CHANNEL_LABEL,
+                        lossyInit,
+                    ).also { dataChannel ->
+                        lossyDataChannelManager = DataChannelManager(dataChannel, DataChannelObserver(dataChannel), rtcThreadToken)
+                        dataChannel.registerObserver(lossyDataChannelManager)
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * @param builder an optional builder to include other parameters related to the track
+     */
+    suspend fun addTrack(
+        cid: String,
+        name: String,
+        kind: LivekitModels.TrackType,
+        stream: String?,
+        builder: LivekitRtc.AddTrackRequest.Builder = LivekitRtc.AddTrackRequest.newBuilder(),
+    ): LivekitModels.TrackInfo {
+        synchronized(pendingTrackResolvers) {
+            if (pendingTrackResolvers[cid] != null) {
+                throw TrackException.DuplicateTrackException("Track with same ID $cid has already been published!")
+            }
+        }
+
+        // Suspend until signal client receives message confirming track publication.
+        return withDeadline(20.seconds) {
+            suspendCancellableCoroutine { cont ->
+                synchronized(pendingTrackResolvers) {
+                    pendingTrackResolvers[cid] = cont
+                }
+                cont.invokeOnCancellation {
+                    synchronized(pendingTrackResolvers) {
+                        if (pendingTrackResolvers[cid] === cont) {
+                            pendingTrackResolvers.remove(cid)
+                        }
+                    }
+                }
+                client.sendAddTrack(
+                    cid = cid,
+                    name = name,
+                    type = kind,
+                    stream = stream,
+                    builder = builder,
+                )
+            }
+        }
+    }
+
+    internal suspend fun createSenderTransceiver(
+        rtcTrack: MediaStreamTrack,
+        transInit: RtpTransceiverInit,
+    ): RtpTransceiver? {
+        return publisher?.withPeerConnection {
+            addTransceiver(rtcTrack, transInit)
+        }
+    }
+
+    fun updateSubscriptionPermissions(
+        allParticipants: Boolean,
+        participantTrackPermissions: List<ParticipantTrackPermission>,
+    ) {
+        client.sendUpdateSubscriptionPermissions(allParticipants, participantTrackPermissions)
+    }
+
+    fun updateMuteStatus(sid: String, muted: Boolean) {
+        client.sendMuteTrack(sid, muted)
+    }
+
+    fun updateLocalAudioTrack(sid: String, features: Collection<AudioTrackFeature>) {
+        client.sendUpdateLocalAudioTrack(sid, features)
+    }
+
+    fun close(reason: String = "Normal Closure") {
+        if (isClosed) {
+            return
+        }
+        LKLog.i { "Close in - $reason" }
+        isClosed = true
+        reconnectingJob?.cancel()
+        reconnectingJob = null
+        coroutineScope.close()
+        hasPublished = false
+        publisherConnectionState = null
+        hasPublisherEverConnected = false
+        isSubscriberPrimary = false
+        sessionUrl = null
+        sessionToken = null
+        connectOptions = null
+        lastRoomOptions = null
+        participantSid = null
+        regionUrlProvider = null
+        abortPendingPublishTracks()
+        closeResources(reason)
+        connectionState = ConnectionState.DISCONNECTED
+
+        synchronized(reliableStateLock) {
+            reliableDataSequence = 1
+            reliableMessageBuffer.clear()
+            reliableReceivedState.clear()
+        }
+
+        LKLog.i { "Close out - $reason" }
+    }
+
+    private fun closeResources(reason: String) {
+        LKLog.i { "closeResources in - $reason" }
+        executeBlockingOnRTCThread(rtcThreadToken) {
+            runBlocking {
+                configurationLock.withLock {
+                    publisherObserver?.connectionChangeListener = null
+                    subscriberObserver?.connectionChangeListener = null
+                    publisher?.closeBlocking()
+                    publisher = null
+                    subscriber?.closeBlocking()
+                    subscriber = null
+                    publisherObserver = null
+                    subscriberObserver = null
+                    publisherConnectionState = null
+
+                    reliableBufferedAmountJob?.cancel()
+                    reliableBufferedAmountJob = null
+                    reliableDataChannelManager?.dispose()
+                    reliableDataChannelManager = null
+                    reliableDataChannel = null
+                    reliableDataChannelSubManager?.dispose()
+                    reliableDataChannelSubManager = null
+                    reliableDataChannelSub = null
+                    lossyDataChannelManager?.dispose()
+                    lossyDataChannelManager = null
+                    lossyDataChannel = null
+                    lossyDataChannelSubManager?.dispose()
+                    lossyDataChannelSubManager = null
+                    lossyDataChannelSub = null
+                    isSubscriberPrimary = false
+                }
+            }
+        }
+        LKLog.i { "closeResources out(rtc) - $reason" }
+        client.close(reason = reason)
+        LKLog.i { "closeResources out - $reason" }
+    }
+
+    private fun abortPendingPublishTracks() {
+        synchronized(pendingTrackResolvers) {
+            pendingTrackResolvers.values.forEach {
+                it.resumeWithException(TrackException.PublishException("pending track aborted"))
+            }
+            pendingTrackResolvers.clear()
+        }
+    }
+
+    override fun onTransportRestarted(result: Int, address: String?) {
+        LKLog.i { "[reconnect][quic] callback received, result=$result, address=$address" }
+        val continuation = restartContinuation
+        if (continuation == null) {
+            LKLog.i { "[reconnect][quic] callback ignored: no pending restart continuation" }
+            return
+        }
+        restartContinuation = null
+        continuation.resume(result == 0)
+    }
+
+    private suspend fun tryQuicRestart(networkHandle: Long): Boolean {
+        LKLog.i {
+            "[reconnect][quic] requested, networkHandle=$networkHandle, clientConnected=${client.isConnected}"
+        }
+        val result = withTimeoutOrNull(3000L) {
+            suspendCancellableCoroutine { cont ->
+                restartContinuation = cont
+                client.restartTransport(networkHandle)
+                cont.invokeOnCancellation {
+                    if (restartContinuation === cont) {
+                        restartContinuation = null
+                    }
+                }
+            }
+        }
+        if (result == null) {
+            if (restartContinuation != null) {
+                restartContinuation = null
+            }
+            LKLog.w { "[reconnect][quic] timeout waiting for restart callback, networkHandle=$networkHandle" }
+            return false
+        }
+        return result
+    }
+
+    private fun negotiatePublisherIceRestart() {
+        if (!client.isConnected) {
+            return
+        }
+        coroutineScope.launch {
+            negotiatePublisherMutex.withLock {
+                val constraints = MediaConstraints().apply {
+                    with(mandatory) {
+                        add(MediaConstraints.KeyValuePair(MediaConstraintKeys.OFFER_TO_RECV_AUDIO, MediaConstraintKeys.FALSE))
+                        add(MediaConstraints.KeyValuePair(MediaConstraintKeys.OFFER_TO_RECV_VIDEO, MediaConstraintKeys.FALSE))
+                        add(MediaConstraints.KeyValuePair(MediaConstraintKeys.ICE_RESTART, MediaConstraintKeys.TRUE))
+                    }
+                }
+                publisher?.negotiate?.invoke(constraints)
+            }
+        }
+    }
+
+    /**
+     * reconnect Signal and PeerConnections
+     */
+    @Synchronized
+    @VisibleForTesting(otherwise = VisibleForTesting.PACKAGE_PRIVATE)
+    fun reconnect(networkHandle: Long = 0, reason: String = "unspecified") {
+        LKLog.i {
+            "[reconnect][net] reconnect invoked, networkHandle=$networkHandle, " +
+                "reconnecting=${reconnectingJob?.isActive == true}, state=$connectionState, reason=$reason"
+        }
+        if (reconnectingJob?.isActive == true) {
+            LKLog.d { "[reconnect][net] reconnect skipped: reconnection is already in progress, reason=$reason" }
+            return
+        }
+        if (this.isClosed) {
+            LKLog.d { "[reconnect][net] reconnect skipped: engine is closed, reason=$reason" }
+            return
+        }
+        var url = sessionUrl
+        val token = sessionToken
+        if (url == null || token == null) {
+            LKLog.w { "[reconnect][net] reconnect skipped: no url or no token, reason=$reason" }
+            return
+        }
+        pendingNetworkHandle = networkHandle
+        val job = coroutineScope.launch {
+            var hasResumedOnce = false
+            var hasReconnectedOnce = false
+            val reconnectReason = reason
+
+            val reconnectStartTime = SystemClock.elapsedRealtime()
+            val reconnectPolicy = this@RTCEngine.reconnectPolicy
+
+            for (retries in 0 until MAX_RECONNECT_RETRIES) {
+                // First try use previously valid url.
+                if (retries != 0) {
+                    try {
+                        url = regionUrlProvider?.getNextBestRegionUrl() ?: url
+                    } catch (e: Exception) {
+                        e.rethrowIfCancellationSignal()
+                        LKLog.d(e) { "[reconnect][net][${retries + 1}] Exception while getting next best region url while reconnecting." }
+                    }
+                }
+
+                ensureActive()
+                if (retries != 0) {
+                    yield()
+                }
+
+                if (isClosed) {
+                    LKLog.i { "[reconnect][net][${retries + 1}] RTCEngine closed (section 1), aborting reconnection" }
+                    break
+                }
+
+                val reconnectContext = ReconnectContext(
+                    retryCount = retries,
+                    elapsedTime = (SystemClock.elapsedRealtime() - reconnectStartTime).milliseconds,
+                )
+                var startDelay = reconnectPolicy.getNextRetryDelay(reconnectContext)
+                if (startDelay == null) {
+                    LKLog.i { "[reconnect][net][${retries + 1}] cancelling reconnection due to policy, reason=$reconnectReason" }
+                    break
+                }
+                if (fullReconnectOnNext) {
+                    LKLog.i { "[reconnect][net][${retries + 1}] full reconnect requested, skipping reconnect delay, reason=$reconnectReason" }
+                    startDelay = 0.milliseconds
+                }
+
+                LKLog.i { "[reconnect][signal][${retries + 1}] reconnecting to signal, delay=$startDelay, reason=$reconnectReason" }
+                if (startDelay > 0.milliseconds) {
+                    delay(startDelay)
+                }
+
+                val forceFullReconnect = fullReconnectOnNext
+                if (forceFullReconnect) {
+                    fullReconnectOnNext = false
+                }
+                val isFullReconnect = when (reconnectType) {
+                    // full reconnect after first try.
+                    ReconnectType.DEFAULT -> retries != 0 || forceFullReconnect
+                    ReconnectType.FORCE_SOFT_RECONNECT -> false
+                    ReconnectType.FORCE_FULL_RECONNECT -> true
+                }
+
+                var lastMessageSeq: Int? = null
+                val connectOptions = connectOptions ?: ConnectOptions()
+                suspend fun performSignalReconnect() {
+                    LKLog.i { "[reconnect][signal][${retries + 1}] signal connect in." }
+                    val response = client.reconnect(url!!, token, participantSid)
+                    LKLog.i { "[reconnect][signal][${retries + 1}] signal connect out." }
+                    if (response is Either.Left) {
+                        val reconnectResponse = response.value
+                        val rtcConfig = makeRTCConfig(Either.Right(reconnectResponse), connectOptions)
+                        subscriber?.updateRTCConfig(rtcConfig)
+                        publisher?.updateRTCConfig(rtcConfig)
+                        lastMessageSeq = reconnectResponse.lastMessageSeq
+                    } else {
+                        LKLog.w { "[reconnect][signal][${retries + 1}] Did not receive reconnect response" }
+                    }
+                    client.onReadyForResponses()
+                    LKLog.i { "[reconnect][signal][${retries + 1}] signal reconnect succeeded, starting ICE restart" }
+                    listener?.onSignalConnected(true)
+
+                    if (hasPublished) {
+                        negotiatePublisher()
+                    }
+                }
+                if (isFullReconnect) {
+                    LKLog.i { "[reconnect][signal][${retries + 1}] attempting full reconnect" }
+
+                    if (!hasReconnectedOnce) {
+                        hasReconnectedOnce = true
+                        listener?.onEngineReconnecting()
+                    }
+                    connectionState = ConnectionState.RECONNECTING
+                    try {
+                        closeResources("[${retries + 1}] Full Reconnecting")
+                        listener?.onFullReconnecting()
+                        joinImpl(url!!, token, connectOptions, lastRoomOptions ?: RoomOptions())
+                    } catch (e: Exception) {
+                        e.rethrowIfCancellationSignal()
+                        LKLog.w(e) { "[reconnect][signal][${retries + 1}] Error during reconnection." }
+                        // reconnect failed, retry.
+                        continue
+                    }
+                } else {
+                    if (!hasResumedOnce) {
+                        hasResumedOnce = true
+                        listener?.onEngineResuming()
+                    }
+                    connectionState = ConnectionState.RESUMING
+                    val attemptNetworkHandle = if (retries == 0) pendingNetworkHandle else 0L
+                    if (retries == 0) {
+                        pendingNetworkHandle = 0
+                    }
+                    LKLog.i {
+                        "[reconnect][net][${retries + 1}] Attempting soft reconnect, " +
+                            "networkHandle=$attemptNetworkHandle, useQuic=${connectOptions.useQuicSignal}, " +
+                            "clientConnected=${client.isConnected}"
+                    }
+                    subscriber?.prepareForIceRestart()
+                    val shouldTryQuicRestart =
+                        attemptNetworkHandle != 0L &&
+                            connectOptions.useQuicSignal &&
+                            !client.isQuicMarkedUnhealthy &&
+                            client.isConnected
+                    if (shouldTryQuicRestart) {
+                        LKLog.i {
+                            "[reconnect][quic][${retries + 1}] soft reconnect fast path: trying QUIC restart, " +
+                                "networkHandle=$attemptNetworkHandle"
+                        }
+                        val restartOk = tryQuicRestart(attemptNetworkHandle)
+                        if (restartOk) {
+                            LKLog.i { "[reconnect][quic][${retries + 1}] QUIC restart succeeded, keeping signal session" }
+                            listener?.onSignalConnected(true)
+                            // The server-side iceLite bug that caused subscriber candidate-pair selection to fail has been fixed, so an ICE restart is no longer needed here.
+//                            if (hasPublished) {
+//                                negotiatePublisherIceRestart()
+//                            }
+                        } else {
+                            LKLog.i { "[reconnect][quic][${retries + 1}] QUIC restart failed, falling back to signal reconnect" }
+                            try {
+                                performSignalReconnect()
+                            } catch (e: Exception) {
+                                e.rethrowIfCancellationSignal()
+                                LKLog.w(e) { "[reconnect][signal][${retries + 1}] error during fallback signal reconnect: ${e.message}" }
+                                continue
+                            }
+                        }
+                    } else {
+                        LKLog.i {
+                            "[reconnect][signal][${retries + 1}] direct signal reconnect path, " +
+                                "networkHandle=$attemptNetworkHandle, useQuic=${connectOptions.useQuicSignal}, " +
+                                "clientConnected=${client.isConnected}"
+                        }
+                        try {
+                            performSignalReconnect()
+                        } catch (e: Exception) {
+                            e.rethrowIfCancellationSignal()
+                            LKLog.w(e) { "[reconnect][signal][${retries + 1}] error during signal reconnect: ${e.message}" }
+                            continue
+                        }
+                    }
+                }
+
+                ensureActive()
+                if (isClosed) {
+                    LKLog.i { "[reconnect][net][${retries + 1}] RTCEngine closed (section 2), aborting reconnection" }
+                    break
+                }
+
+                var interruptedForFullReconnect = false
+                var waitJobs = emptyList<Job>()
+                val waitCompleted: Boolean = withTimeoutOrNull(MAX_ICE_CONNECT_TIMEOUT_MS.toLong()) {
+                    LKLog.i {
+                        "[reconnect][ice][${retries + 1}] waiting for ICE reconnect, expectReconnect=${!isFullReconnect}, " +
+                            "hasPublished=$hasPublished"
+                    }
+                    // wait until publisher ICE connected
+                    var publisherWaitJob: Job? = null
+                    if (hasPublished) {
+                        val waitPublisherObserver = publisherObserver
+                        if (waitPublisherObserver != null) {
+                            publisherWaitJob = launch {
+                                waitPublisherObserver.waitUntilConnected()
+                            }
+                        } else {
+                            LKLog.w { "[reconnect][ice][${retries + 1}] publisher observer missing while waiting reconnect" }
+                        }
+                    }
+
+                    // wait until subscriber ICE connected
+                    val waitSubscriberObserver = subscriberObserver
+                    val subscriberWaitJob = if (waitSubscriberObserver != null) {
+                        launch {
+                            waitSubscriberObserver.waitUntilConnected()
+                        }
+                    } else {
+                        LKLog.w { "[reconnect][ice][${retries + 1}] subscriber observer missing while waiting reconnect" }
+                        null
+                    }
+
+                    waitJobs = listOfNotNull(publisherWaitJob, subscriberWaitJob)
+
+                    while (waitJobs.any { !it.isCompleted }) {
+                        // Server has asked for a full reconnect (e.g. STATE_MISMATCH):
+                        // stop waiting current ICE attempt and move to next reconnect loop.
+                        if (!isFullReconnect && fullReconnectOnNext) {
+                            interruptedForFullReconnect = true
+                            return@withTimeoutOrNull false
+                        }
+                        delay(50)
+                    }
+                    true
+                } ?: false
+
+                LKLog.i { "[reconnect][ice][${retries + 1}] ICE wait finished, waitCompleted=$waitCompleted" }
+                if (!waitCompleted) {
+                    waitJobs.forEach { it.cancel() }
+                }
+                if (interruptedForFullReconnect) {
+                    LKLog.i { "[reconnect][ice][${retries + 1}] full reconnect requested while waiting ICE; aborting current wait" }
+                    continue
+                }
+
+                ensureActive()
+                if (isClosed) {
+                    LKLog.i { "[reconnect][net][${retries + 1}] RTCEngine closed (section 3), aborting reconnection" }
+                    break
+                }
+
+                val subscriberConnected = subscriber?.isConnected() == true
+                val publisherConnected = !hasPublished || publisher?.isConnected() == true
+                val reconnected = (connectionState == ConnectionState.CONNECTED || connectionState == ConnectionState.RESUMING) && subscriberConnected && publisherConnected
+                LKLog.i {
+                    "[reconnect][ice][${retries + 1}] reconnect-check subscriberConnected=$subscriberConnected, " +
+                        "publisherConnected=$publisherConnected, hasPublished=$hasPublished, reconnected=$reconnected"
+                }
+
+                if (reconnected) {
+                    if (connectionState == ConnectionState.RESUMING) {
+                        LKLog.i { "[reconnect][ice][${retries + 1}] connectionState change $connectionState => CONNECTED" }
+                        // ICE restart may keep PC state as CONNECTED and never emit a fresh callback.
+                        connectionState = ConnectionState.CONNECTED
+                    }
+                    val resumeMessageSeq = lastMessageSeq
+                    if (resumeMessageSeq != null) {
+                        resendReliableMessagesForResume(resumeMessageSeq).onFailure { e ->
+                            LKLog.w(e) {
+                                "[reconnect][signal][${retries + 1}] Reliable data replay did not complete on resume; " +
+                                    "buffered items remain queued for the next resume."
+                            }
+                        }
+                    }
+                    // Is connected, notify and return.
+                    regionUrlProvider?.clearAttemptedRegions()
+                    client.onPCConnected()
+                    listener?.onPostReconnect(isFullReconnect)
+                    return@launch
+                }
+
+                // Didn't manage to reconnect, check if should continue to next attempt.
+                val curReconnectTime = SystemClock.elapsedRealtime() - reconnectStartTime
+                if (curReconnectTime > MAX_RECONNECT_TIMEOUT) {
+                    break
+                }
+            }
+
+            close("Failed reconnecting")
+            listener?.onEngineDisconnected(DisconnectReason.RECONNECT_FAILED)
+        }
+
+        reconnectingJob = job
+        job.invokeOnCompletion {
+            if (reconnectingJob == job) {
+                reconnectingJob = null
+            }
+        }
+    }
+
+    internal suspend fun waitForInitialPCConnection(timeoutMs: Long = INITIAL_PC_CONNECT_TIMEOUT_MS) {
+        val startMs = SystemClock.elapsedRealtime()
+        var failedTransport: String? = null
+        var signalLost = false
+        // Fixed per join; close() resets it, which must not drop the subscriber requirement mid-wait.
+        val subscriberRequired = isSubscriberPrimary
+        val connected = withTimeoutOrNull(timeoutMs) {
+            while (isActive) {
+                // Checked before the signal state: a DISCONNECT leave closes the signal, and
+                // must not surface as a retryable signal loss.
+                throwIfLeftDuringInitialConnect()
+                // Connection-lost callbacks are suppressed during the initial connect, so a dead
+                // signal must fail the wait here or connect would succeed without signaling.
+                if (!client.isConnected) {
+                    signalLost = true
+                    return@withTimeoutOrNull false
+                }
+                val subscriberState = subscriberObserver?.connectionState
+                val publisherRequired = !subscriberRequired || hasPublished
+                val publisherState = publisherObserver?.connectionState
+                if (subscriberState.isTerminalIfRequired(subscriberRequired)) {
+                    failedTransport = TRANSPORT_SUBSCRIBER
+                    return@withTimeoutOrNull false
+                }
+                if (publisherState.isTerminalIfRequired(publisherRequired)) {
+                    failedTransport = TRANSPORT_PUBLISHER
+                    return@withTimeoutOrNull false
+                }
+                if (subscriberState.isReadyIfRequired(subscriberRequired) && publisherState.isReadyIfRequired(publisherRequired)) {
+                    return@withTimeoutOrNull true
+                }
+                delay(50)
+            }
+            false
+        } ?: false
+        // onLeave stores the error before close() tears anything down, so a poll that observed
+        // the teardown (signal closed, PC CLOSED, hasPublished reset) sees it here.
+        throwIfLeftDuringInitialConnect()
+        if (connected) {
+            return
+        }
+        if (signalLost) {
+            LKLog.w { "[connect] signal lost during initial connect, elapsedMs=${SystemClock.elapsedRealtime() - startMs}" }
+            throw RoomException.ConnectException("signal lost during initial connect")
+        }
+
+        val transport = failedTransport
+            ?: if (subscriberObserver?.connectionState.isReadyIfRequired(subscriberRequired)) TRANSPORT_PUBLISHER else TRANSPORT_SUBSCRIBER
+        val elapsedMs = SystemClock.elapsedRealtime() - startMs
+        LKLog.w { "[connect] $transport not connected, failed=${failedTransport != null}, elapsedMs=$elapsedMs" }
+        throw RoomException.MediaUnreachableException(
+            message = "could not establish $transport connection",
+            transport = transport,
+            failed = failedTransport != null,
+            elapsedMs = elapsedMs,
+        )
+    }
+
+    // DISCONNECTED is deliberately excluded: ICE may still recover from it.
+    private fun PeerConnection.PeerConnectionState?.isTerminalIfRequired(required: Boolean): Boolean =
+        required && (this == PeerConnection.PeerConnectionState.FAILED || this == PeerConnection.PeerConnectionState.CLOSED)
+
+    private fun PeerConnection.PeerConnectionState?.isReadyIfRequired(required: Boolean): Boolean =
+        !required || this?.isConnected() == true
+
+    private fun throwIfLeftDuringInitialConnect() {
+        val (generation, error) = initialConnectLeaveError ?: return
+        if (generation == sessionGeneration) {
+            throw error
+        }
+    }
+
+    internal fun negotiatePublisher() {
+        // Mark intent to publish before checking Signal state so reconnect() can
+        // re-trigger negotiation even if the first attempt occurs before Signal connects.
+        hasPublished = true
+
+        if (!client.isConnected) {
+            return
+        }
+
+        coroutineScope.launch {
+            negotiatePublisherMutex.withLock {
+                publisher?.negotiate?.invoke(getPublisherOfferConstraints())
+            }
+        }
+    }
+
+    @CheckResult
+    internal suspend fun sendData(dataPacket: LivekitModels.DataPacket): Result<Unit> {
+        try {
+            ensurePublisherConnected(dataPacket.kind)
+        } catch (e: Exception) {
+            e.rethrowIfCancellationSignal()
+            return Result.failure(e)
+        }
+
+        fun sendDataImpl(dataPacket: LivekitModels.DataPacket): Result<Unit> {
+            try {
+                // Redeclare to make variable
+                var dataPacket = dataPacket
+
+                val e2EEManager = e2EEManager
+                val dataEncryptionEnabled = e2EEManager?.isDataChannelEncryptionEnabled() ?: false
+                if (dataEncryptionEnabled && e2EEManager != null) {
+                    val encryptedPacketPayload = dataPacket.asEncryptedPacketPayload()
+                    if (encryptedPacketPayload != null) {
+                        val encryptedData = e2EEManager.encrypt(encryptedPacketPayload.toByteArray())
+                        if (encryptedData != null) {
+                            dataPacket = with(dataPacket.toBuilder()) {
+                                encryptedPacket = with(LivekitModels.EncryptedPacket.newBuilder()) {
+                                    encryptedValue = ByteString.copyFrom(encryptedData.payload)
+                                    iv = ByteString.copyFrom(encryptedData.iv)
+                                    keyIndex = encryptedData.keyIndex
+                                    encryptionType = LivekitModels.Encryption.Type.GCM
+                                    build()
+                                }
+                                build()
+                            }
+                        }
+                    }
+                }
+
+                val isReliable = dataPacket.kind == LivekitModels.DataPacket.Kind.RELIABLE
+                if (isReliable) {
+                    dataPacket = dataPacket.toBuilder()
+                        .setSequence(reliableDataSequence)
+                        .build()
+                }
+
+                val packetBytes = dataPacket.toByteArray()
+
+                if (packetBytes.size > MAX_DATA_PACKET_SIZE) {
+                    return Result.failure(IllegalArgumentException("packet size (${packetBytes.size}) exceeds the max size (${MAX_DATA_PACKET_SIZE})"))
+                }
+
+                // Buffer reliable messages during both full (RECONNECTING) and quick
+                // (RESUMING) reconnect. The reliable buffer is replayed by
+                // resendReliableMessagesForResume once the publisher reconnects, so
+                // callers don't lose data and we avoid sending into a torn-down
+                // DataChannel mid-reconnect.
+                // See Docs/reconnect-metrics-storm-and-worker-crash-fix.md (Fix-7).
+                if (isReliable && (this.connectionState == ConnectionState.RECONNECTING ||
+                        this.connectionState == ConnectionState.RESUMING)) {
+                    reliableMessageBuffer.queue(DataPacketItem(ByteBuffer.wrap(packetBytes), dataPacket.sequence))
+                    reliableDataSequence++
+                    return Result.success(Unit)
+                }
+                val buf = DataChannel.Buffer(
+                    ByteBuffer.wrap(packetBytes),
+                    true,
+                )
+                val channel = dataChannelForKind(dataPacket.kind)
+                    ?: throw RoomException.ConnectException("channel not established for ${dataPacket.kind.name}")
+
+                if (!channel.send(buf)) {
+                    return Result.failure(
+                        RoomException.ConnectException("failed to send data packet for ${dataPacket.kind.name}"),
+                    )
+                }
+
+                if (isReliable) {
+                    // Wrap a fresh ByteBuffer so the queued item's position stays at 0; the
+                    // ByteBuffer just sent has been drained by DataChannel.send.
+                    reliableMessageBuffer.queue(DataPacketItem(ByteBuffer.wrap(packetBytes), dataPacket.sequence))
+                    reliableDataSequence++
+                }
+            } catch (e: Exception) {
+                e.rethrowIfCancellationSignal()
+                return Result.failure(e)
+            }
+            return Result.success(Unit)
+        }
+
+        if (dataPacket.kind == LivekitModels.DataPacket.Kind.RELIABLE) {
+            synchronized(reliableStateLock) {
+                return sendDataImpl(dataPacket)
+            }
+        } else {
+            return sendDataImpl(dataPacket)
+        }
+    }
+
+    internal suspend fun resendReliableMessagesForResume(lastMessageSeq: Int): Result<Unit> {
+        try {
+            ensurePublisherConnected(LivekitModels.DataPacket.Kind.RELIABLE)
+        } catch (e: Exception) {
+            e.rethrowIfCancellationSignal()
+            return Result.failure(e)
+        }
+        val channel = dataChannelForKind(LivekitModels.DataPacket.Kind.RELIABLE)
+            ?: return Result.failure(NullPointerException("reliable channel not established!"))
+
+        synchronized(reliableStateLock) {
+            reliableMessageBuffer.popToSequence(lastMessageSeq)
+            for (item in reliableMessageBuffer.getAll()) {
+                // Send a duplicate so the underlying buffer keeps position=0 and survives
+                // multiple resume attempts. DataChannel.send drains the buffer's position to
+                // its limit; without duplicate(), the second replay would send empty bytes.
+                if (!channel.send(DataChannel.Buffer(item.data.duplicate(), true))) {
+                    return Result.failure(
+                        RoomException.ConnectException(
+                            "failed to replay reliable data packet at sequence ${item.sequence}",
+                        ),
+                    )
+                }
+            }
+        }
+
+        return Result.success(Unit)
+    }
+
+    internal suspend fun waitForBufferStatusLow(kind: LivekitModels.DataPacket.Kind) {
+        try {
+            ensurePublisherConnected(kind)
+        } catch (e: Exception) {
+            e.rethrowIfCancellationSignal()
+            return
+        }
+        val manager = dataChannelManagerForKind(kind) ?: return
+        manager.waitForBufferedAmountLow(DATA_CHANNEL_LOW_THRESHOLD.toLong())
+    }
+
+    @Throws(exceptionClasses = [RoomException.ConnectException::class])
+    private suspend fun ensurePublisherConnected(kind: LivekitModels.DataPacket.Kind) {
+        if (!isSubscriberPrimary) {
+            return
+        }
+
+        if (publisher == null) {
+            throw RoomException.ConnectException("Publisher isn't setup yet! Is the room connected?")
+        }
+
+        if (publisher?.isConnected() != true &&
+            publisher?.iceConnectionState() != PeerConnection.IceConnectionState.CHECKING
+        ) {
+            // start negotiation
+            this.negotiatePublisher()
+        }
+
+        // Ensure data channel exists
+        dataChannelForKind(kind) ?: throw RoomException.ConnectException("Publisher data channel not established for ${kind.name}; is the room connected?")
+
+        val channelManager = dataChannelManagerForKind(kind)
+            ?: throw RoomException.ConnectException("Publisher data channel manager not established for ${kind.name}; is the room connected?")
+        if (channelManager.state == DataChannel.State.OPEN) {
+            return
+        }
+
+        // wait until publisher ICE connected
+        val endTime = SystemClock.elapsedRealtime() + MAX_ICE_CONNECT_TIMEOUT_MS
+        while (SystemClock.elapsedRealtime() < endTime) {
+            if (publisher?.isConnected() == true &&
+                channelManager.state == DataChannel.State.OPEN
+            ) {
+                return
+            }
+            delay(50)
+        }
+
+        throw RoomException.ConnectException(
+            "could not establish publisher connection: publisher state: ${publisherObserver?.connectionState}, channel state: ${channelManager.state}",
+        )
+    }
+
+    private fun dataChannelManagerForKind(kind: LivekitModels.DataPacket.Kind): DataChannelManager? =
+        when (kind) {
+            LivekitModels.DataPacket.Kind.RELIABLE -> reliableDataChannelManager
+            LivekitModels.DataPacket.Kind.LOSSY -> lossyDataChannelManager
+            LivekitModels.DataPacket.Kind.UNRECOGNIZED -> throw IllegalArgumentException("Unknown data packet kind!")
+        }
+
+    private fun dataChannelForKind(kind: LivekitModels.DataPacket.Kind) =
+        when (kind) {
+            LivekitModels.DataPacket.Kind.RELIABLE -> reliableDataChannel
+            LivekitModels.DataPacket.Kind.LOSSY -> lossyDataChannel
+            LivekitModels.DataPacket.Kind.UNRECOGNIZED -> throw IllegalArgumentException("Unknown data packet kind!")
+        }
+
+    private fun getPublisherOfferConstraints(): MediaConstraints {
+        return MediaConstraints().apply {
+            with(mandatory) {
+                add(
+                    MediaConstraints.KeyValuePair(
+                        MediaConstraintKeys.OFFER_TO_RECV_AUDIO,
+                        MediaConstraintKeys.FALSE,
+                    ),
+                )
+                add(
+                    MediaConstraints.KeyValuePair(
+                        MediaConstraintKeys.OFFER_TO_RECV_VIDEO,
+                        MediaConstraintKeys.FALSE,
+                    ),
+                )
+                if (connectionState == ConnectionState.RECONNECTING || connectionState == ConnectionState.RESUMING) {
+                    add(
+                        MediaConstraints.KeyValuePair(
+                            MediaConstraintKeys.ICE_RESTART,
+                            MediaConstraintKeys.TRUE,
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    private fun makeRTCConfig(
+        serverResponse: Either<JoinResponse, ReconnectResponse>,
+        connectOptions: ConnectOptions,
+    ): RTCConfiguration {
+        // Convert protobuf ice servers
+        val serverIceServers = run {
+            val servers = mutableListOf<PeerConnection.IceServer>()
+            val responseServers = when (serverResponse) {
+                is Either.Left -> serverResponse.value.iceServersList
+                is Either.Right -> serverResponse.value.iceServersList
+            }
+            for (serverInfo in responseServers) {
+                servers.add(serverInfo.toWebrtc())
+            }
+
+//            if (servers.isEmpty()) {
+//                servers.addAll(SignalClient.DEFAULT_ICE_SERVERS)
+//            }
+            servers
+        }
+
+        val rtcConfig = connectOptions.rtcConfig?.copy()?.apply {
+            val mergedServers = iceServers.toMutableList()
+            connectOptions.iceServers?.forEach { server ->
+                if (!mergedServers.contains(server)) {
+                    mergedServers.add(server)
+                }
+            }
+
+            // Only use server-provided servers if user doesn't provide any.
+            if (mergedServers.isEmpty()) {
+                iceServers.forEach { server ->
+                    if (!mergedServers.contains(server)) {
+                        mergedServers.add(server)
+                    }
+                }
+            }
+
+            iceServers = mergedServers
+        }
+            ?: RTCConfiguration(serverIceServers).apply {
+                sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
+                continualGatheringPolicy =
+                    PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
+            }
+
+        val clientConfig = when (serverResponse) {
+            is Either.Left -> {
+                if (serverResponse.value.hasClientConfiguration()) {
+                    serverResponse.value.clientConfiguration
+                } else {
+                    null
+                }
+            }
+
+            is Either.Right -> {
+                if (serverResponse.value.hasClientConfiguration()) {
+                    serverResponse.value.clientConfiguration
+                } else {
+                    null
+                }
+            }
+        }
+        if (clientConfig != null) {
+            if (clientConfig.forceRelay == LivekitModels.ClientConfigSetting.ENABLED) {
+                rtcConfig.iceTransportsType = PeerConnection.IceTransportsType.RELAY
+            }
+        }
+
+        // Remove local 0.0.0.0 listener; disable tcp(server current not support tcp forward)
+        rtcConfig.tcpCandidatePolicy = PeerConnection.TcpCandidatePolicy.DISABLED
+
+        return rtcConfig
+    }
+
+    internal interface Listener {
+        fun onEngineConnected()
+        fun onEngineReconnected()
+        fun onEngineReconnecting()
+        fun onEngineResuming() {}
+        fun onEngineResumed() {}
+        fun onEngineConnectionLost(reason: String = "unspecified") {}
+        fun onEngineDisconnected(reason: DisconnectReason)
+        fun onFailToConnect(error: Throwable)
+        fun onJoinResponse(response: JoinResponse)
+        fun onAddTrack(receiver: RtpReceiver, track: MediaStreamTrack, streams: Array<out MediaStream>)
+        fun onUpdateParticipants(updates: List<LivekitModels.ParticipantInfo>)
+        fun onActiveSpeakersUpdate(speakers: List<LivekitModels.SpeakerInfo>)
+        fun onRemoteMuteChanged(trackSid: String, muted: Boolean)
+        fun onRoomUpdate(update: LivekitModels.Room)
+        fun onConnectionQuality(updates: List<LivekitRtc.ConnectionQualityInfo>)
+        fun onSpeakersChanged(speakers: List<LivekitModels.SpeakerInfo>)
+        fun onUserPacket(packet: LivekitModels.UserPacket, kind: LivekitModels.DataPacket.Kind, encryptionType: LivekitModels.Encryption.Type)
+        fun onStreamStateUpdate(streamStates: List<LivekitRtc.StreamStateInfo>)
+        fun onSubscribedQualityUpdate(subscribedQualityUpdate: LivekitRtc.SubscribedQualityUpdate)
+        fun onSubscriptionPermissionUpdate(subscriptionPermissionUpdate: LivekitRtc.SubscriptionPermissionUpdate)
+        fun onSubscriptionError(subscriptionResponse: LivekitRtc.SubscriptionResponse)
+        fun onSignalConnected(isResume: Boolean)
+        fun onFullReconnecting()
+        suspend fun onPostReconnect(isFullReconnect: Boolean)
+        fun onLocalTrackUnpublished(trackUnpublished: LivekitRtc.TrackUnpublishedResponse)
+        fun onTranscriptionReceived(transcription: LivekitModels.Transcription)
+        fun onLocalTrackSubscribed(trackSubscribed: LivekitRtc.TrackSubscribed)
+        fun onRpcPacketReceived(dp: LivekitModels.DataPacket)
+        fun onDataStreamPacket(dp: LivekitModels.DataPacket, encryptionType: LivekitModels.Encryption.Type)
+    }
+
+    companion object {
+
+        /**
+         * @suppress
+         */
+        @VisibleForTesting
+        const val RELIABLE_DATA_CHANNEL_LABEL = "_reliable"
+
+        /**
+         * @suppress
+         */
+        @VisibleForTesting
+        const val LOSSY_DATA_CHANNEL_LABEL = "_lossy"
+        internal const val TARGET_DATA_PACKET_SIZE = 15 * 1024 // 15 KB
+
+        /**
+         * Corresponds to the max-message-size in SDP. Attempting to send packets
+         * over this size will cause the data channel to close, so this must be enforced
+         * within the SDK. Note that [DataChannel.send] will still report true
+         * even if a huge packet is sent, so it's not a usable signal.
+         *
+         * TODO: get max-message-size from SDP or equivalent from libwebrtc.
+         */
+        internal const val MAX_DATA_PACKET_SIZE = 64 * 1024 - 1 // 64 KB
+        private const val MAX_RECONNECT_RETRIES = 30
+        private const val MAX_RECONNECT_TIMEOUT = 60 * 1000
+        private const val MAX_ICE_CONNECT_TIMEOUT_MS = 20000
+        internal const val INITIAL_PC_CONNECT_TIMEOUT_MS = 15_000L
+        internal const val TRANSPORT_SUBSCRIBER = "subscriber"
+        internal const val TRANSPORT_PUBLISHER = "publisher"
+
+        private const val DATA_CHANNEL_LOW_THRESHOLD = 2 * 1024 * 1024 // 2 MB
+
+        private val RELIABLE_RECEIVE_STATE_TTL_MS = 30.seconds
+        private val RELIABLE_RETRY_AMOUNT = (DATA_CHANNEL_LOW_THRESHOLD * 1.25).toLong()
+
+        // Server leave reasons that are recoverable by rejoining the room. When a leave with
+        // one of these reasons arrives with a DISCONNECT action, the client forces a full
+        // reconnect instead of ending the call.
+        private val RECOVERABLE_LEAVE_REASONS = setOf(
+            LivekitModels.DisconnectReason.STATE_MISMATCH,
+        )
+
+        internal val CONN_CONSTRAINTS = MediaConstraints().apply {
+            with(optional) {
+                add(MediaConstraints.KeyValuePair("DtlsSrtpKeyAgreement", "true"))
+            }
+        }
+    }
+
+    // ---------------------------------- SignalClient.Listener --------------------------------------//
+
+    override fun onServerAnswer(sessionDescription: SessionDescription, offerId: Int) {
+        LKLog.v { "received server answer: ${sessionDescription.type}, ${runBlocking { publisher?.signalingState() }}" }
+        coroutineScope.launch {
+            when (val outcome = publisher?.setRemoteDescription(sessionDescription, offerId).nullSafe()) {
+                is Either.Left -> {
+                    // do nothing.
+                }
+
+                is Either.Right -> {
+                    LKLog.e { "error setting remote description for answer: ${outcome.value} " }
+                }
+            }
+        }
+    }
+
+    override fun onServerOffer(sessionDescription: SessionDescription, offerId: Int) {
+        LKLog.v { "received server offer: ${sessionDescription.type}, ${runBlocking { publisher?.signalingState() }}" }
+        coroutineScope.launch {
+            run {
+                when (val outcome = subscriber?.setRemoteDescription(sessionDescription, offerId).nullSafe()) {
+                    is Either.Right -> {
+                        LKLog.e { "error setting remote description for offer: ${outcome.value} " }
+                        return@launch
+                    }
+
+                    else -> {}
+                }
+            }
+
+            if (isClosed) {
+                return@launch
+            }
+
+            val answer = run {
+                when (val outcome = subscriber?.withPeerConnection { createAnswer(MediaConstraints()) }.nullSafe()) {
+                    is Either.Left -> outcome.value
+                    is Either.Right -> {
+                        LKLog.e { "error creating answer: ${outcome.value}" }
+                        return@launch
+                    }
+                }
+            }
+
+            if (isClosed) {
+                return@launch
+            }
+
+            run<Unit> {
+                when (val outcome = subscriber?.withPeerConnection { setLocalDescription(answer) }.nullSafe()) {
+                    is Either.Left -> Unit
+                    is Either.Right -> {
+                        LKLog.e { "error setting local description for answer: ${outcome.value}" }
+                        return@launch
+                    }
+                }
+            }
+
+            if (isClosed) {
+                return@launch
+            }
+            client.sendAnswer(answer, offerId)
+        }
+    }
+
+    override fun onTrickle(candidate: IceCandidate, target: LivekitRtc.SignalTarget) {
+        LKLog.v { "received ice candidate from peer: $candidate, $target" }
+        when (target) {
+            LivekitRtc.SignalTarget.PUBLISHER -> {
+                publisher?.addIceCandidate(candidate)
+                    ?: LKLog.w { "received candidate for publisher when we don't have one. ignoring." }
+            }
+
+            LivekitRtc.SignalTarget.SUBSCRIBER -> {
+                subscriber?.addIceCandidate(candidate)
+                    ?: LKLog.w { "received candidate for subscriber when we don't have one. ignoring." }
+            }
+
+            else -> LKLog.i { "unknown ice candidate target?" }
+        }
+    }
+
+    override fun onLocalTrackPublished(response: LivekitRtc.TrackPublishedResponse) {
+        val cid = response.cid ?: run {
+            LKLog.e { "local track published with null cid?" }
+            return
+        }
+
+        val track = response.track
+        if (track == null) {
+            LKLog.d { "local track published with null track info?" }
+        }
+
+        LKLog.v { "local track published $cid" }
+        val cont = synchronized(pendingTrackResolvers) {
+            pendingTrackResolvers.remove(cid)
+        }
+        if (cont == null) {
+            LKLog.d { "missing track resolver for: $cid" }
+            return
+        }
+        cont.resume(response.track)
+    }
+
+    override fun onLocalTrackSubscribed(trackSubscribed: LivekitRtc.TrackSubscribed) {
+        listener?.onLocalTrackSubscribed(trackSubscribed)
+    }
+
+    override fun onParticipantUpdate(updates: List<LivekitModels.ParticipantInfo>) {
+        listener?.onUpdateParticipants(updates)
+    }
+
+    override fun onSpeakersChanged(speakers: List<LivekitModels.SpeakerInfo>) {
+        listener?.onSpeakersChanged(speakers)
+    }
+
+    override fun onClose(reason: String, code: Int) {
+        LKLog.i { "received close event: $reason, code: $code" }
+        abortPendingPublishTracks()
+        listener?.onEngineConnectionLost("signal closed: (code=$code reason=$reason)")
+    }
+
+    override fun onRemoteMuteChanged(trackSid: String, muted: Boolean) {
+        listener?.onRemoteMuteChanged(trackSid, muted)
+    }
+
+    override fun onRoomUpdate(update: LivekitModels.Room) {
+        listener?.onRoomUpdate(update)
+    }
+
+    override fun onConnectionQuality(updates: List<LivekitRtc.ConnectionQualityInfo>) {
+        listener?.onConnectionQuality(updates)
+    }
+
+    override fun onLeave(leave: LeaveRequest) {
+        LKLog.d { "leave request received: reason = ${leave.reason.name}, action = ${leave.action.name}" }
+
+        // Capture the session this leave belongs to. If a new session starts while we
+        // tear the old one down below (close() blocks on the RTC thread), the resulting
+        // disconnect must not be propagated against the new session.
+        val disconnectGeneration = sessionGeneration
+
+        abortPendingPublishTracks()
+
+        if (leave.hasRegions()) {
+            regionUrlProvider?.setServerReportedRegions(RegionSettings.fromProto(leave.regions))
+        }
+
+        if (isInitialConnect && failInitialConnectOnLeave(leave, disconnectGeneration)) {
+            return
+        }
+
+        when {
+            leave.action == LeaveRequest.Action.RESUME -> {
+                // Trigger resume immediately instead of waiting for onClose.
+                fullReconnectOnNext = false
+                coroutineScope.launch {
+                    yield()
+                    reconnect(reason = "server leave action=${leave.action.name} reason=${leave.reason.name}")
+                }
+            }
+
+            leave.action == LeaveRequest.Action.RECONNECT ||
+                // canReconnect is deprecated protocol version >= 13
+                leave.canReconnect -> {
+                // Trigger full reconnect immediately instead of waiting for onClose.
+                fullReconnectOnNext = true
+                coroutineScope.launch {
+                    yield()
+                    reconnect(reason = "server leave action=${leave.action.name} reason=${leave.reason.name}")
+                }
+            }
+
+            // Some servers send a DISCONNECT action with a recoverable reason (e.g.
+            // STATE_MISMATCH after a resume the server considers stale). This is
+            // recoverable by rejoining, so force a full reconnect instead of tearing
+            // down the call.
+            leave.reason in RECOVERABLE_LEAVE_REASONS -> {
+                LKLog.i {
+                    "leave action=${leave.action.name} reason=${leave.reason.name} is recoverable, " +
+                        "forcing full reconnect instead of disconnect"
+                }
+                fullReconnectOnNext = true
+                coroutineScope.launch {
+                    yield()
+                    reconnect(reason = "server leave action=${leave.action.name} reason=${leave.reason.name}")
+                }
+            }
+
+            else -> {
+                close()
+                if (sessionGeneration != disconnectGeneration) {
+                    LKLog.w {
+                        "leave/disconnect superseded by a newer session " +
+                            "(gen $disconnectGeneration -> $sessionGeneration), " +
+                            "skipping onEngineDisconnected to keep the current session"
+                    }
+                    return
+                }
+                val disconnectReason = leave.reason.convert()
+                listener?.onEngineDisconnected(disconnectReason)
+            }
+        }
+    }
+
+    /**
+     * Hands the leave to [waitForInitialPCConnection]. Returns true if the leave asked
+     * for a resume/reconnect, which must not run while the initial connect is pending.
+     */
+    private fun failInitialConnectOnLeave(leave: LeaveRequest, generation: Long): Boolean {
+        val reconnectRequested = leave.action == LeaveRequest.Action.RESUME ||
+            leave.action == LeaveRequest.Action.RECONNECT ||
+            leave.canReconnect ||
+            leave.reason in RECOVERABLE_LEAVE_REASONS
+        LKLog.w {
+            "[connect] leave during initial connect, action=${leave.action.name} reason=${leave.reason.name}, " +
+                "reconnectRequested=$reconnectRequested"
+        }
+        initialConnectLeaveError = generation to if (reconnectRequested) {
+            RoomException.ConnectException("signal lost during initial connect")
+        } else {
+            CancellationException("server leave during initial connect, reason=${leave.reason.name}")
+        }
+        return reconnectRequested
+    }
+
+    // Signal error
+    override fun onError(error: Throwable) {
+        if (connectionState == ConnectionState.CONNECTING) {
+            listener?.onFailToConnect(error)
+        }
+    }
+
+    override fun onStreamStateUpdate(streamStates: List<LivekitRtc.StreamStateInfo>) {
+        listener?.onStreamStateUpdate(streamStates)
+    }
+
+    override fun onSubscribedQualityUpdate(subscribedQualityUpdate: LivekitRtc.SubscribedQualityUpdate) {
+        listener?.onSubscribedQualityUpdate(subscribedQualityUpdate)
+    }
+
+    override fun onSubscriptionPermissionUpdate(subscriptionPermissionUpdate: LivekitRtc.SubscriptionPermissionUpdate) {
+        listener?.onSubscriptionPermissionUpdate(subscriptionPermissionUpdate)
+    }
+
+    override fun onSubscriptionError(subscriptionResponse: LivekitRtc.SubscriptionResponse) {
+        listener?.onSubscriptionError(subscriptionResponse)
+    }
+
+    override fun onRefreshToken(token: String) {
+        sessionToken = token
+        regionUrlProvider?.token = token
+    }
+
+    override fun onLocalTrackUnpublished(trackUnpublished: LivekitRtc.TrackUnpublishedResponse) {
+        listener?.onLocalTrackUnpublished(trackUnpublished)
+    }
+
+    // --------------------------------- DataChannel.Observer ------------------------------------//
+
+    fun onBufferedAmountChange(dataChannel: DataChannel, previousAmount: Long) {
+    }
+
+    fun onStateChange(dataChannel: DataChannel) {
+    }
+
+    fun onMessage(dataChannel: DataChannel, buffer: DataChannel.Buffer?) {
+        if (buffer == null) {
+            return
+        }
+        var dp = try {
+            LivekitModels.DataPacket.parseFrom(ByteString.copyFrom(buffer.data))
+        } catch (e: com.google.protobuf.InvalidProtocolBufferException) {
+            LKLog.w(e) { "Failed to parse DataPacket, discarding malformed message." }
+            return
+        }
+
+        if (dp.sequence > 0 && dp.participantSid.isNotEmpty()) {
+            synchronized(reliableStateLock) {
+                val lastSeq = reliableReceivedState[dp.participantSid]
+                if (lastSeq != null && dp.sequence <= lastSeq) {
+                    // ignore duplicate or out-of-order packets in reliable channel
+                    return
+                }
+                this.reliableReceivedState[dp.participantSid] = dp.sequence
+            }
+        }
+
+        // Always decrypt if able, to allow for backward compatibility.
+        val dataPacketCryptor = dataPacketCryptorManager
+        var encryptionType = LivekitModels.Encryption.Type.NONE
+        if (dp.hasEncryptedPacket() && dataPacketCryptor != null) {
+            val encryptedPacket = EncryptedPacket(
+                dp.encryptedPacket.encryptedValue.toByteArray(),
+                dp.encryptedPacket.iv.toByteArray(),
+                dp.encryptedPacket.keyIndex,
+            )
+            encryptionType = dp.encryptedPacket.encryptionType
+
+            val decryptedData = dataPacketCryptor.decrypt(Participant.Identity(dp.participantIdentity), encryptedPacket)
+            if (decryptedData == null) {
+                LKLog.i { "Failed to decrypt data packet." }
+                return
+            }
+            val payload = try {
+                LivekitModels.EncryptedPacketPayload.parseFrom(decryptedData)
+            } catch (e: com.google.protobuf.InvalidProtocolBufferException) {
+                LKLog.w(e) { "Failed to parse decrypted EncryptedPacketPayload, discarding message." }
+                return
+            }
+
+            dp = with(dp.toBuilder()) {
+                setFromEncryptedPayload(payload)
+                build()
+            }
+        }
+
+        when (dp.valueCase) {
+            LivekitModels.DataPacket.ValueCase.SPEAKER -> {
+                listener?.onActiveSpeakersUpdate(dp.speaker.speakersList)
+            }
+
+            LivekitModels.DataPacket.ValueCase.USER -> {
+                listener?.onUserPacket(dp.user, dp.kind, encryptionType)
+            }
+
+            LivekitModels.DataPacket.ValueCase.SIP_DTMF -> {
+                // TODO
+            }
+
+            LivekitModels.DataPacket.ValueCase.TRANSCRIPTION -> {
+                listener?.onTranscriptionReceived(dp.transcription)
+            }
+
+            LivekitModels.DataPacket.ValueCase.METRICS -> {
+                // TODO
+            }
+
+            LivekitModels.DataPacket.ValueCase.CHAT_MESSAGE -> {
+                // TODO
+            }
+
+            LivekitModels.DataPacket.ValueCase.RPC_REQUEST,
+            LivekitModels.DataPacket.ValueCase.RPC_ACK,
+            LivekitModels.DataPacket.ValueCase.RPC_RESPONSE,
+            -> {
+                listener?.onRpcPacketReceived(dp)
+            }
+
+            LivekitModels.DataPacket.ValueCase.STREAM_HEADER,
+            LivekitModels.DataPacket.ValueCase.STREAM_CHUNK,
+            LivekitModels.DataPacket.ValueCase.STREAM_TRAILER,
+            -> {
+                listener?.onDataStreamPacket(dp, encryptionType)
+            }
+
+            LivekitModels.DataPacket.ValueCase.ENCRYPTED_PACKET -> {
+                // should be handled above.
+            }
+
+            LivekitModels.DataPacket.ValueCase.VALUE_NOT_SET,
+            null,
+            -> {
+                LKLog.v { "invalid value for data packet" }
+            }
+        }
+    }
+
+    private inner class DataChannelObserver(val dataChannel: DataChannel) : DataChannel.Observer {
+        override fun onBufferedAmountChange(p0: Long) {
+            this@RTCEngine.onBufferedAmountChange(dataChannel, p0)
+        }
+
+        override fun onStateChange() {
+            this@RTCEngine.onStateChange(dataChannel)
+        }
+
+        override fun onMessage(p0: DataChannel.Buffer) {
+            this@RTCEngine.onMessage(dataChannel, p0)
+        }
+    }
+
+    fun sendSyncState(
+        subscription: LivekitRtc.UpdateSubscription,
+        publishedTracks: List<LivekitRtc.TrackPublishedResponse>,
+    ) {
+        var answer: LivekitRtc.SessionDescription? = null
+        var offer: LivekitRtc.SessionDescription? = null
+        runBlocking {
+            subscriber?.withPeerConnection {
+                answer = localDescription?.toProtoSessionDescription()
+                offer = remoteDescription?.toProtoSessionDescription()
+            }
+        }
+
+        val dataChannelInfos = LivekitModels.DataPacket.Kind.entries
+            .filterNot { it == LivekitModels.DataPacket.Kind.UNRECOGNIZED }
+            .mapNotNull { kind -> dataChannelForKind(kind) }
+            .map { dataChannel ->
+                LivekitRtc.DataChannelInfo.newBuilder()
+                    .setId(dataChannel.id())
+                    .setLabel(dataChannel.label())
+                    .build()
+            }
+
+        val dataChannelReceiveStates = synchronized(reliableStateLock) {
+            this.reliableReceivedState.map { (participantSid, sequence) ->
+                with(LivekitRtc.DataChannelReceiveState.newBuilder()) {
+                    publisherSid = participantSid
+                    lastSeq = sequence
+                    build()
+                }
+            }
+        }
+
+        val syncState = with(LivekitRtc.SyncState.newBuilder()) {
+            if (answer != null) {
+                setAnswer(answer)
+            }
+            if (offer != null) {
+                setOffer(offer)
+            }
+            setSubscription(subscription)
+            addAllPublishTracks(publishedTracks)
+            addAllDataChannels(dataChannelInfos)
+            addAllDatachannelReceiveStates(dataChannelReceiveStates)
+            build()
+        }
+
+        client.sendSyncState(syncState)
+    }
+
+    fun getPublisherRTCStats(callback: RTCStatsCollectorCallback) {
+        runBlocking {
+            publisher?.withPeerConnection { getStats(callback) }
+                ?: callback.onStatsDelivered(RTCStatsReport(0, emptyMap()))
+        }
+    }
+
+    fun getSubscriberRTCStats(callback: RTCStatsCollectorCallback) {
+        runBlocking {
+            subscriber?.withPeerConnection { getStats(callback) }
+                ?: callback.onStatsDelivered(RTCStatsReport(0, emptyMap()))
+        }
+    }
+
+    fun createStatsGetter(sender: RtpSender): RTCStatsGetter {
+        val p = publisher
+        return { statsCallback: RTCStatsCollectorCallback ->
+            runBlocking {
+                p?.withPeerConnection {
+                    getStats(sender, statsCallback)
+                } ?: statsCallback.onStatsDelivered(RTCStatsReport(0, emptyMap()))
+            }
+        }
+    }
+
+    fun createStatsGetter(receiver: RtpReceiver): RTCStatsGetter {
+        val p = subscriber
+        return { statsCallback: RTCStatsCollectorCallback ->
+            runBlocking {
+                p?.withPeerConnection {
+                    getStats(receiver, statsCallback)
+                } ?: statsCallback.onStatsDelivered(RTCStatsReport(0, emptyMap()))
+            }
+        }
+    }
+
+    internal fun registerTrackBitrateInfo(cid: String, trackBitrateInfo: TrackBitrateInfo) {
+        publisher?.registerTrackBitrateInfo(cid, trackBitrateInfo)
+    }
+
+    internal fun removeTrack(rtcTrack: MediaStreamTrack) {
+        runBlocking {
+            publisher?.withPeerConnection {
+                val senders = this.senders
+                for (sender in senders) {
+                    val t = sender.track() ?: continue
+                    if (t.id() == rtcTrack.id()) {
+                        this@withPeerConnection.removeTrack(sender)
+                    }
+                }
+            }
+        }
+    }
+
+    internal fun stopTransceivers(transceivers: List<RtpTransceiver>) {
+        if (transceivers.isEmpty()) {
+            return
+        }
+        runBlocking {
+            publisher?.withPeerConnection {
+                for (transceiver in transceivers) {
+                    if (!transceiver.isStopped) {
+                        transceiver.stopInternal()
+                    }
+                }
+            }
+        }
+    }
+
+    @VisibleForTesting
+    fun getPublisherPeerConnection() =
+        publisher!!.peerConnection
+
+    @VisibleForTesting
+    fun getSubscriberPeerConnection() =
+        subscriber!!.peerConnection
+}
+
+/**
+ * @suppress
+ */
+enum class ReconnectType {
+    DEFAULT,
+    FORCE_SOFT_RECONNECT,
+    FORCE_FULL_RECONNECT,
+}
+
+/**
+ * @suppress
+ */
+fun LivekitRtc.ICEServer.toWebrtc(): PeerConnection.IceServer = PeerConnection.IceServer.builder(urlsList)
+    .setUsername(username ?: "")
+    .setPassword(credential ?: "")
+    .setTlsAlpnProtocols(emptyList())
+    .setTlsEllipticCurves(emptyList())
+    .createIceServer()
+
+typealias PeerConnectionStateListener = (PeerConnectionState, String) -> Unit
+
+internal fun LivekitModels.DataPacket.asEncryptedPacketPayload(): LivekitModels.EncryptedPacketPayload? {
+    return when (valueCase) {
+        LivekitModels.DataPacket.ValueCase.USER -> {
+            LivekitModels.EncryptedPacketPayload.newBuilder()
+                .setUser(this.user)
+                .build()
+        }
+
+        LivekitModels.DataPacket.ValueCase.RPC_REQUEST -> {
+            LivekitModels.EncryptedPacketPayload.newBuilder()
+                .setRpcRequest(this.rpcRequest)
+                .build()
+        }
+
+        LivekitModels.DataPacket.ValueCase.RPC_ACK -> {
+            LivekitModels.EncryptedPacketPayload.newBuilder()
+                .setRpcAck(this.rpcAck)
+                .build()
+        }
+
+        LivekitModels.DataPacket.ValueCase.RPC_RESPONSE -> {
+            LivekitModels.EncryptedPacketPayload.newBuilder()
+                .setRpcResponse(this.rpcResponse)
+                .build()
+        }
+
+        LivekitModels.DataPacket.ValueCase.STREAM_HEADER -> {
+            LivekitModels.EncryptedPacketPayload.newBuilder()
+                .setStreamHeader(this.streamHeader)
+                .build()
+        }
+
+        LivekitModels.DataPacket.ValueCase.STREAM_CHUNK -> {
+            LivekitModels.EncryptedPacketPayload.newBuilder()
+                .setStreamChunk(this.streamChunk)
+                .build()
+        }
+
+        LivekitModels.DataPacket.ValueCase.STREAM_TRAILER -> {
+            LivekitModels.EncryptedPacketPayload.newBuilder()
+                .setStreamTrailer(this.streamTrailer)
+                .build()
+        }
+
+        LivekitModels.DataPacket.ValueCase.CHAT_MESSAGE -> {
+            LivekitModels.EncryptedPacketPayload.newBuilder()
+                .setChatMessage(this.chatMessage)
+                .build()
+        }
+
+        LivekitModels.DataPacket.ValueCase.METRICS,
+        LivekitModels.DataPacket.ValueCase.SIP_DTMF,
+        LivekitModels.DataPacket.ValueCase.SPEAKER,
+        LivekitModels.DataPacket.ValueCase.ENCRYPTED_PACKET,
+        LivekitModels.DataPacket.ValueCase.TRANSCRIPTION,
+        LivekitModels.DataPacket.ValueCase.VALUE_NOT_SET,
+        -> {
+            null
+        }
+    }
+}
+
+internal fun LivekitModels.DataPacket.Builder.setFromEncryptedPayload(payload: LivekitModels.EncryptedPacketPayload) {
+    when (payload.valueCase) {
+        LivekitModels.EncryptedPacketPayload.ValueCase.USER -> {
+            this.user = payload.user
+        }
+
+        LivekitModels.EncryptedPacketPayload.ValueCase.CHAT_MESSAGE -> {
+            this.chatMessage = payload.chatMessage
+        }
+
+        LivekitModels.EncryptedPacketPayload.ValueCase.RPC_REQUEST -> {
+            this.rpcRequest = payload.rpcRequest
+        }
+
+        LivekitModels.EncryptedPacketPayload.ValueCase.RPC_ACK -> {
+            this.rpcAck = payload.rpcAck
+        }
+
+        LivekitModels.EncryptedPacketPayload.ValueCase.RPC_RESPONSE -> {
+            this.rpcResponse = payload.rpcResponse
+        }
+
+        LivekitModels.EncryptedPacketPayload.ValueCase.STREAM_HEADER -> {
+            this.streamHeader = payload.streamHeader
+        }
+
+        LivekitModels.EncryptedPacketPayload.ValueCase.STREAM_CHUNK -> {
+            this.streamChunk = payload.streamChunk
+        }
+
+        LivekitModels.EncryptedPacketPayload.ValueCase.STREAM_TRAILER -> {
+            this.streamTrailer = payload.streamTrailer
+        }
+
+        LivekitModels.EncryptedPacketPayload.ValueCase.VALUE_NOT_SET -> {
+            // decryption likely failed
+            LKLog.w { "Attempting to set from non-valid payload" }
+        }
+    }
+}

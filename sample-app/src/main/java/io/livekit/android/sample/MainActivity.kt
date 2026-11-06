@@ -1,0 +1,202 @@
+/*
+ * Copyright 2024-2026 LiveKit, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package io.livekit.android.sample
+
+import android.content.Intent
+import android.os.Bundle
+import android.text.SpannableStringBuilder
+import android.view.View
+import android.widget.ArrayAdapter
+import android.widget.Toast
+import androidx.activity.viewModels
+import androidx.appcompat.app.AppCompatActivity
+import io.livekit.android.sample.databinding.MainActivityBinding
+import io.livekit.android.sample.model.StressTest
+import io.livekit.android.sample.proxy.ProxyConfig
+import io.livekit.android.sample.util.requestNeededPermissions
+
+class MainActivity : AppCompatActivity() {
+
+    private val viewModel by viewModels<MainViewModel>()
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        val binding = MainActivityBinding.inflate(layoutInflater)
+
+        val presets = viewModel.presets
+        val presetAdapter = PresetDropdownAdapter(this, presets)
+        binding.presetDropdown.setAdapter(presetAdapter)
+
+        var selectedPreset = viewModel.getSelectedPreset()
+        binding.presetDropdown.setText(selectedPreset.displayText, false)
+
+        // RTC proxy dropdown: "No Proxy" + each proxy defined in local-config.json.
+        val proxies = viewModel.proxies
+        val proxyLabels = (listOf(MainViewModel.PROXY_LABEL_NONE) + proxies.map { it.label }).toTypedArray()
+        val proxyAdapter = ArrayAdapter(this, android.R.layout.simple_dropdown_item_1line, proxyLabels)
+        binding.rtcProxyDropdown.setAdapter(proxyAdapter)
+        val selectedProxyLabel = viewModel.getSelectedProxy()?.label ?: MainViewModel.PROXY_LABEL_NONE
+        binding.rtcProxyDropdown.setText(selectedProxyLabel, false)
+
+        fun selectedProxy(): ProxyPreset? {
+            val label = binding.rtcProxyDropdown.text.toString()
+            return proxies.find { it.label == label }
+        }
+
+        val e2EEOn = viewModel.getE2EEOptionsOn()
+        val e2EEKey = viewModel.getSavedE2EEKey()
+        val savedQuicDeviceType = viewModel.getQuicDeviceType()
+        val savedQuicCidTag = viewModel.getQuicCidTag()
+        val savedQuicConnectTimeoutMs = viewModel.getQuicConnectTimeoutMs()
+        val savedForcePhysical = viewModel.getForcePhysicalOn()
+
+        binding.run {
+            e2eeEnabled.isChecked = e2EEOn
+            e2eeKey.editText?.text = SpannableStringBuilder(e2EEKey)
+            quicEnabled.isChecked = selectedPreset.useQuicSignal
+            forcePhysicalEnabled.isChecked = savedForcePhysical
+            quicConnectTimeout.editText?.text = SpannableStringBuilder(savedQuicConnectTimeoutMs.toString())
+            quicDeviceType.editText?.text = SpannableStringBuilder(savedQuicDeviceType.toString())
+            quicCidTag.editText?.text = SpannableStringBuilder(savedQuicCidTag)
+
+            fun updateQuicControls() {
+                quicConnectTimeout.visibility = if (quicEnabled.isChecked) View.VISIBLE else View.GONE
+                forcePhysicalEnabled.isEnabled = quicEnabled.isChecked && selectedProxy() == null
+                if (!forcePhysicalEnabled.isEnabled) {
+                    forcePhysicalEnabled.isChecked = false
+                }
+            }
+
+            updateQuicControls()
+            quicEnabled.setOnCheckedChangeListener { _, _ ->
+                updateQuicControls()
+            }
+
+            presetDropdown.setOnItemClickListener { _, _, position, _ ->
+                val row = presetAdapter.getItem(position) as? PresetDropdownAdapter.Row.Entry
+                    ?: return@setOnItemClickListener
+                selectedPreset = row.preset
+                quicEnabled.isChecked = row.preset.useQuicSignal
+            }
+            rtcProxyDropdown.setOnItemClickListener { _, _, _, _ ->
+                updateQuicControls()
+            }
+
+            connectButton.setOnClickListener {
+                val preset = selectedPreset
+                val quicDeviceTypeInt =
+                    quicDeviceType.editText?.text?.toString()?.toIntOrNull()
+                        ?: MainViewModel.DEFAULT_QUIC_DEVICE_TYPE
+                val quicCidTagStr = quicCidTag.editText?.text?.toString().orEmpty()
+                val quicConnectTimeoutMs = if (quicEnabled.isChecked) {
+                    val parsed = parseQuicConnectTimeoutMs(quicConnectTimeout.editText?.text?.toString().orEmpty())
+                    if (parsed == null) {
+                        quicConnectTimeout.error = QUIC_CONNECT_TIMEOUT_ERROR
+                        return@setOnClickListener
+                    }
+                    quicConnectTimeout.error = null
+                    viewModel.setQuicConnectTimeoutMs(parsed)
+                    parsed
+                } else {
+                    quicConnectTimeout.error = null
+                    DEFAULT_QUIC_CONNECT_TIMEOUT_MS
+                }
+                val proxy = selectedProxy()
+                val intent = Intent(this@MainActivity, CallActivity::class.java).apply {
+                    putExtra(
+                        CallActivity.KEY_ARGS,
+                        CallActivity.BundleArgs(
+                            url = preset.url,
+                            token = preset.token,
+                            e2eeOn = e2eeEnabled.isChecked,
+                            e2eeKey = e2eeKey.editText?.text.toString(),
+                            quicOn = quicEnabled.isChecked,
+                            forcePhysical = forcePhysicalEnabled.isChecked,
+                            quicDeviceType = quicDeviceTypeInt,
+                            quicCidTag = quicCidTagStr,
+                            quicConnectTimeoutMs = quicConnectTimeoutMs,
+                            serverHost = preset.serverHost,
+                            caCertPem = preset.caCertPem,
+                            proxyEnabled = proxy != null,
+                            proxyHost = proxy?.host.orEmpty(),
+                            proxyPort = proxy?.port ?: ProxyConfig.DEFAULT_PORT,
+                            proxySpkiPin = proxy?.spkiPin.orEmpty(),
+                            proxyTurnSecret = proxy?.turnSecret.orEmpty(),
+                            proxySni = proxy?.sni.orEmpty(),
+                            stressTest = StressTest.None,
+                        ),
+                    )
+                }
+
+                startActivity(intent)
+            }
+
+            saveButton.setOnClickListener {
+                viewModel.setSavedPresetKey(selectedPreset.key)
+                viewModel.setSavedE2EEOn(e2eeEnabled.isChecked)
+                viewModel.setSavedE2EEKey(e2eeKey.editText?.text?.toString() ?: "")
+                viewModel.setForcePhysicalOn(forcePhysicalEnabled.isChecked)
+                viewModel.setQuicDeviceType(
+                    quicDeviceType.editText?.text?.toString()?.toIntOrNull()
+                        ?: MainViewModel.DEFAULT_QUIC_DEVICE_TYPE,
+                )
+                viewModel.setQuicCidTag(quicCidTag.editText?.text?.toString().orEmpty())
+                parseQuicConnectTimeoutMs(quicConnectTimeout.editText?.text?.toString().orEmpty())
+                    ?.let(viewModel::setQuicConnectTimeoutMs)
+                viewModel.setSavedProxyId(selectedProxy()?.id ?: MainViewModel.PROXY_ID_NONE)
+
+                Toast.makeText(
+                    this@MainActivity,
+                    "Values saved.",
+                    Toast.LENGTH_SHORT,
+                ).show()
+            }
+
+            resetButton.setOnClickListener {
+                viewModel.reset()
+                selectedPreset = presets.first()
+                presetDropdown.setText(selectedPreset.displayText, false)
+                quicEnabled.isChecked = selectedPreset.useQuicSignal
+                forcePhysicalEnabled.isChecked = false
+                e2eeEnabled.isChecked = false
+                e2eeKey.editText?.text = SpannableStringBuilder("")
+                quicDeviceType.editText?.text =
+                    SpannableStringBuilder(MainViewModel.DEFAULT_QUIC_DEVICE_TYPE.toString())
+                quicCidTag.editText?.text = SpannableStringBuilder(MainViewModel.DEFAULT_QUIC_CID_TAG)
+                quicConnectTimeout.editText?.text =
+                    SpannableStringBuilder(DEFAULT_QUIC_CONNECT_TIMEOUT_MS.toString())
+                quicConnectTimeout.error = null
+                rtcProxyDropdown.setText(MainViewModel.PROXY_LABEL_NONE, false)
+                updateQuicControls()
+
+                Toast.makeText(
+                    this@MainActivity,
+                    "Values reset.",
+                    Toast.LENGTH_SHORT,
+                ).show()
+            }
+        }
+
+        setContentView(binding.root)
+
+        requestNeededPermissions()
+    }
+
+    private companion object {
+        const val QUIC_CONNECT_TIMEOUT_ERROR = "Enter an integer from 1000 to 15000 ms"
+    }
+}

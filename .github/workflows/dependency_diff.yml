@@ -1,0 +1,59 @@
+name: Generate dependency diff
+
+on:
+  pull_request:
+    branches: [ main ]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - 'NOTICE'
+      - '.gitignore'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  generate-diff:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-java@1bcf9fb12cf4aa7d266a90ae39939e61372fe520 # v5.4.0
+        with:
+          distribution: 'adopt'
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
+
+      - id: dependency-diff
+        name: Generate dependency diff
+        uses: usefulness/dependency-tree-diff-action@59b54501869fa22e102545c8a3a006aa3c3a3c2e # v2.2.0
+        with:
+          project: 'livekit-android-sdk'
+
+      - name: Log dependency diff
+        run: |
+          echo "Dependency diff:"
+          echo "${{ steps.dependency-diff.outputs.text-diff }}"
+
+      - uses: peter-evans/find-comment@b30e6a3c0ed37e7c023ccd3f1db5c6c0b0c23aad # v4.0.0
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        id: find_comment
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          body-includes: Dependency diff
+
+      - uses: peter-evans/create-or-update-comment@e8674b075228eee787fea43ef493e45ece1004c9 # v5.0.0
+        if: github.event.pull_request.head.repo.full_name == github.repository && (steps.dependency-diff.outputs.text-diff != null || steps.find_comment.outputs.comment-id != null)
+        with:
+          body: |
+            Dependency diff:
+              ```diff
+              ${{ steps.dependency-diff.outputs.text-diff }}
+              ```
+          edit-mode: replace
+          comment-id: ${{ steps.find_comment.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number }}
+          token: ${{ secrets.GITHUB_TOKEN }}
